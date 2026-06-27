@@ -2,3 +2,12 @@ node_modules/
 client/dist/
 .env
 uploads/
+
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local env files
+.env.local

@@ -4,16 +4,14 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "cd client && npm install && npx vite build",
+    "prestart": "npm run build",
     "start": "node index.js",
-"build": "cd client && npx vite build",
-"dev": "cd client && npx vite",
-  "preview": "vite preview",
-  "seed:refund-demo": "node seed-refund-demo.js",
-  "seed:image": "node seed-images.js",
-  "seed:purchases": "node seed-purchases.js"
-
-
-
+    "start:no-build": "node index.js",
+    "dev": "cd client && npx vite",
+    "preview": "vite preview",
+    "seed:refund-demo": "node seed-refund-demo.js",
+    "seed:image": "node seed-images.js"
   },
   "author": "Team Schrodinger",
   "license": "ISC",
