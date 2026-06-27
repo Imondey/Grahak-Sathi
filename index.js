@@ -50,16 +50,18 @@ const SALT_ROUNDS = 10;
 // ── SendGrid Setup ────────────────────────────────────────────────────────────
 sgMail.setApiKey(process.env.SENDGRID_API_KEY || '');
 
-// ── Groq / Llama AI Setup ─────────────────────────────────────────────────────
-const Groq = require('groq-sdk');
-const groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY || '' });
+// ── Otari LLM Gateway Setup (Mozilla.ai) ──────────────────────────────────────
+// Replaces the Groq SDK. All LLM traffic routes through the Otari gateway
+// (OpenAI-compatible), which manages provider keys, routing, budgets & usage.
+const { createOtariClient } = require('./lib/otariClient');
+const otari = createOtariClient();
 
 /**
- * Generate a human-readable fraud alert explanation using Llama via Groq.
+ * Generate a human-readable fraud alert explanation via the Otari gateway.
  * Returns a plain-English summary the admin can quickly understand.
  */
 async function generateFraudExplanation({ barcode, product_name, risk_score, action, intelligence_flags, shop_name }) {
-    if (!process.env.GROQ_API_KEY) return null; // Skip if no API key configured
+    if (!otari.enabled) return null; // Skip if the Otari gateway isn't configured
     try {
         const prompt = `You are a retail fraud analyst AI. Write a brief, clear explanation (3-5 sentences) for a store admin about a fraud alert.
 
@@ -73,16 +75,13 @@ Details:
 
 Write in simple language. Explain WHAT happened, WHY it's suspicious, and WHAT the admin should do next. Be concise and actionable.`;
 
-        const chatCompletion = await groqClient.chat.completions.create({
-            messages: [{ role: 'user', content: prompt }],
-            model: 'llama-3.1-8b-instant',
-            temperature: 0.3,
-            max_tokens: 250,
-        });
-
-        return chatCompletion.choices[0]?.message?.content?.trim() || null;
+        const r = await otari.chat(
+            [{ role: 'user', content: prompt }],
+            { temperature: 0.3, maxTokens: 250 }
+        );
+        return r ? r.content : null;
     } catch (err) {
-        console.warn('Groq/Llama fraud explanation error (non-fatal):', err.message);
+        console.warn('Otari fraud explanation error (non-fatal):', err.message);
         return null;
     }
 }
@@ -96,7 +95,7 @@ redisClient.connect()
     .catch(err => { console.error('❌ Redis connection failed:', err.message); });
 
 // ── Cost-Aware AI: budget engine + conversational auditor ──────────────────────
-const HAS_GROQ_KEY = !!process.env.GROQ_API_KEY;
+const LLM_ENABLED  = otari.enabled;   // Otari gateway configured?
 const budgetEngine = createBudgetEngine(redisClient);
 
 // Persist a model-usage record for the transparency dashboard (fire-and-forget).
@@ -142,13 +141,12 @@ async function getCheckoutImage(transactionId) {
 }
 
 const auditor = createAuditor({
-    groqClient,
+    llm:        otari,
     axios,
     fastapiUrl: FASTAPI_URL,
     budget:     budgetEngine,
     router:     modelRouter,
     injection:  injectionFilter,
-    hasGroqKey: HAS_GROQ_KEY,
     logUsage,
     logInjection,
     getCheckoutImage,
@@ -213,8 +211,7 @@ const assistant = createCustomerAssistant({
     router:     modelRouter,
     budget:     budgetEngine,
     auditor,
-    groqClient,
-    hasGroqKey: HAS_GROQ_KEY,
+    llm:        otari,
     lookupProduct,
     lookupOrder,
     logUsage,
@@ -1400,7 +1397,7 @@ async function sendWelcomeEmail(email, ownerName, shopName) {
 }
 
 async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, timestamp, action, intelligence_flags }) {
-    // Generate AI explanation using Llama via Groq
+    // Generate AI explanation via the Otari LLM gateway
     const aiExplanation = await generateFraudExplanation({
         barcode, product_name, risk_score, action,
         intelligence_flags: intelligence_flags || '',
@@ -1611,6 +1608,7 @@ const server = app.listen(PORT, () => {
     console.log(`🚀 SmartRetail → http://localhost:${PORT}`);
     console.log(`   Redis sessions: enabled`);
     console.log(`   FastAPI proxy:  ${FASTAPI_URL}`);
+    console.log(`   Otari gateway:  ${LLM_ENABLED ? otari.endpoint : 'not configured (LLM fallback → human handoff)'}`);
     console.log(`   WebSocket:      ws://localhost:${PORT}/ws`);
 });
 

@@ -15,7 +15,7 @@ When a cashier or customer scans a barcode, Nyatik Nayan runs it through a multi
 - **Admin-controlled customer sessions** — Admins create time-bound, token-based sessions for shoppers. Sessions are expired on payment or admin logout.
 - **UID uniqueness enforcement** — Each barcode+MK ID combination can only be scanned once per session, preventing accidental double-scanning.
 - **Multi-layer fraud intelligence** — Scan frequency tracking, barcode age analysis, fuzzy string matching, YOLO object detection, and OCR-based label verification.
-- **AI-powered fraud explanations** — Llama 3.1 (via Groq) generates human-readable explanations for every fraud alert sent to the retailer.
+- **AI-powered fraud explanations** — Human-readable fraud-alert explanations generated via the Otari LLM gateway (Mozilla.ai) and emailed to the retailer.
 - **Real-time WebSocket updates** — Checkout UI receives instant transaction results and session expiry events.
 - **Low-stock detection** — Automatic email alerts when inventory drops below configurable thresholds, with 24-hour dedup to prevent spam.
 - **Payment flow with stock management** — Atomic stock decrement on payment, with rollback on insufficient inventory.
@@ -29,7 +29,7 @@ When a cashier or customer scans a barcode, Nyatik Nayan runs it through a multi
 | Frontend | React 19 + Vite 8 + React Router 7 |
 | Gateway | Node.js + Express 5 |
 | AI Engine | FastAPI (Python) + YOLOv8/v10 + EasyOCR |
-| AI Explanations | Groq SDK + Llama 3.1 8B |
+| AI Explanations | Otari LLM Gateway (Mozilla.ai, OpenAI-compatible) |
 | Cache / Session Store | Redis (ioredis) |
 | Database | PostgreSQL (pg) |
 | Email (Transactional) | Nodemailer (Gmail SMTP) |
@@ -52,7 +52,7 @@ When a cashier or customer scans a barcode, Nyatik Nayan runs it through a multi
 ┌────────────────────────────▼────────────────────────────────────────┐
 │              Node.js Express Gateway  :3000                         │
 │  Admin + Customer auth · Redis sessions · UID uniqueness gate       │
-│  Redis txn lock · FastAPI proxy · Groq/Llama · SendGrid             │
+│  Redis txn lock · FastAPI proxy · Otari gateway · SendGrid          │
 │  Nodemailer · node-cron (daily digest, low-stock sweep)             │
 └───────────┬─────────────────────────────────────┬───────────────────┘
             │ HTTP proxy                          │ read/write
@@ -154,7 +154,12 @@ MAIL_PASS=your_app_password
 SENDGRID_API_KEY=your_sendgrid_key
 SENDGRID_FROM=alerts@yourdomain.com
 
-GROQ_API_KEY=your_groq_api_key
+# ── Otari LLM Gateway (Mozilla.ai) — replaces Groq ──
+# OpenAI-compatible gateway that manages provider keys, routing & budgets.
+# Leave OTARI_BASE_URL unset to run fully local (LLM fallback → human handoff).
+OTARI_BASE_URL=https://api.otari.ai
+OTARI_API_KEY=your_otari_gateway_key
+OTARI_MODEL=gpt-4o-mini
 
 LOW_STOCK_THRESHOLD=5
 
@@ -345,7 +350,7 @@ Possible `fraud_type` values: `"LABEL_SWAP"`, `"PARTIAL_MISMATCH"`, `"LOW_CONFID
 | Event | System | Email Content |
 |---|---|---|
 | Retailer signs up | Nodemailer (SMTP) | Welcome + onboarding |
-| Transaction blocked (risk > 0.6) | SendGrid + Groq/Llama | Fraud alert + AI explanation |
+| Transaction blocked (risk > 0.6) | SendGrid + Otari gateway | Fraud alert + AI explanation |
 | Fraud flag count >= 3 in 24h | SendGrid | Escalated incident report |
 | Low stock after sale | SendGrid (24h dedup) | Restock warning with item list |
 | Daily at 20:00 | SendGrid (cron) | Transaction digest (approved/blocked stats) |
