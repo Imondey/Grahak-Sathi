@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 import redis.asyncio as aioredis
 from datetime import datetime
 import re
+import asyncio
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
 import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
@@ -85,6 +86,16 @@ async def startup():
             print("⚠️  Prompt-injection LSTM disabled (torch not installed)")
     except Exception as e:
         print(f"⚠️  Injection model init failed ({e}) — Stage-2 classifier disabled")
+
+    # Warm up the OCR reader at boot so the FIRST refund photo doesn't trigger a
+    # multi-second, event-loop-blocking model load mid-request (the usual cause
+    # of "verification unavailable: timeout"). Best-effort; never fatal.
+    try:
+        import easyocr
+        globals()["_ocr_reader"] = await asyncio.to_thread(easyocr.Reader, ["en"], False)
+        print("✅ EasyOCR reader warmed up")
+    except Exception as e:
+        print(f"ℹ️  EasyOCR warm-up skipped ({e}) — OCR will load on first use")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -621,7 +632,11 @@ async def refund_pickup(req: RefundPickupRequest):
             img = _decode_image(req.image_b64)
         except Exception:
             img = None
-    mk_id, barcode, method = recognize_mk_id(img, req.mk_id, req.barcode)
+    # Run OCR off the event loop so a heavy first-time inference can't block
+    # other requests (and trip the client timeout).
+    mk_id, barcode, method = await asyncio.to_thread(
+        recognize_mk_id, img, req.mk_id, req.barcode
+    )
     out["recognized_mk_id"]   = mk_id
     out["recognized_barcode"] = barcode
     out["recognition_method"] = method
