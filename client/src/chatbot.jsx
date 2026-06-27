@@ -57,6 +57,7 @@ export default function ChatbotPage({ user }) {
   const [input, setInput]   = useState('')
   const [txnId, setTxnId]   = useState('')
   const [custId, setCustId] = useState('')
+  const [prodName, setProdName] = useState('')
   const [sending, setSending] = useState(false)
   const [budget, setBudget] = useState(null)
   const [imageB64, setImageB64] = useState(null)
@@ -112,6 +113,7 @@ export default function ChatbotPage({ user }) {
           message: text,
           transaction_id: txnId.trim() || null,
           user_id: custId.trim() || null,
+          product_name: prodName.trim() || null,
           budget_session: budgetSession.current,
           image_b64: attached || null,
         }),
@@ -328,6 +330,10 @@ export default function ChatbotPage({ user }) {
           </div>
           <div style={{ display:'flex', gap:8, marginBottom:8 }}>
             <input value={custId} onChange={e => setCustId(e.target.value)} placeholder="Customer ID (optional, e.g. USER_9921 — verifies the item is in your purchase history)"
+              style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:10, color:'#e9d5ff', fontFamily:'monospace', fontSize:11.5, padding:'9px 13px', outline:'none' }} />
+          </div>
+          <div style={{ display:'flex', gap:8, marginBottom:8 }}>
+            <input value={prodName} onChange={e => setProdName(e.target.value)} placeholder="Product name (e.g. Nestle Milo 500g) — required for a refund"
               style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:10, color:'#e9d5ff', fontFamily:'monospace', fontSize:11.5, padding:'9px 13px', outline:'none' }} />
           </div>
           {imageB64 && (

@@ -1329,6 +1329,7 @@ app.post('/api/chatbot/audit', async (req, res) => {
             channel: req.body?.channel || null,
             userId: req.body?.user_id || null,
             mkId: req.body?.mk_id || null,
+            productName: req.body?.product_name || null,
         });
 
         // Persist the claim outcome for the manager dashboard / audit trail.
@@ -1376,6 +1377,7 @@ app.post('/api/chatbot/ask', async (req, res) => {
             channel: req.body?.channel || null,
             userId: req.body?.user_id || null,
             mkId: req.body?.mk_id || null,
+            productName: req.body?.product_name || null,
         });
 
         // Persist refund-claim outcomes (when the assistant delegated to the auditor).

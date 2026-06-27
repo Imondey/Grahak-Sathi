@@ -145,6 +145,18 @@ class PurchaseVerifyRequest(BaseModel):
     complaint_text: Optional[str] = None
 
 
+class RefundVerifyRequest(BaseModel):
+    """Transaction-anchored refund verification.
+
+    The whole decision hinges on transaction_id: we look up what was sold under
+    that transaction, then confirm the customer's uploaded photo (and stated
+    product name) match it. If they match -> refund possible; otherwise not.
+    """
+    transaction_id: str                          # REQUIRED anchor
+    image_b64:      Optional[str] = None          # photo of the product being returned
+    product_name:   Optional[str] = None          # product name the customer states
+
+
 # ── HELPER ─────────────────────────────────────────────────────────────────────
 def compute_fraud_risk(db_product: Optional[dict], yolo_label: str, ocr_text: str) -> float:
     """
@@ -288,6 +300,34 @@ def recognize_mk_id(img, provided_mk_id=None, provided_barcode=None):
     return None, None, "unrecognized"
 
 
+# ── Transaction-anchored refund matching thresholds (env-overridable) ─────────
+REFUND_VISUAL_MATCH = float(os.getenv("REFUND_VISUAL_MATCH", "0.12"))  # ORB good-match ratio
+REFUND_OCR_MATCH    = float(os.getenv("REFUND_OCR_MATCH", "0.60"))     # OCR text vs product name
+REFUND_NAME_MATCH   = float(os.getenv("REFUND_NAME_MATCH", "0.50"))    # stated name vs sold name
+
+
+def _image_similarity(img_a, img_b) -> float:
+    """ORB feature-match ratio between two images (0..1). Used to confirm the
+    uploaded photo matches the product image stored for the transaction."""
+    if img_a is None or img_b is None:
+        return 0.0
+    try:
+        ga = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
+        gb = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
+        orb = cv2.ORB_create(nfeatures=600)
+        ka, da = orb.detectAndCompute(ga, None)
+        kb, db = orb.detectAndCompute(gb, None)
+        if da is None or db is None or len(ka) == 0 or len(kb) == 0:
+            return 0.0
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(da, db)
+        good = [m for m in matches if m.distance <= 64]
+        return round(min(1.0, len(good) / max(1, min(len(ka), len(kb)))), 3)
+    except Exception as e:
+        print(f"[verify-refund] ORB error: {e}")
+        return 0.0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,6 +393,107 @@ async def verify_purchase(req: PurchaseVerifyRequest):
     result["recognized_barcode"] = barcode
     result["recognition_method"] = method
     return result
+
+
+# ── POST /audit/verify-refund — transaction-anchored refund verification ──────
+@app.post("/audit/verify-refund")
+async def verify_refund(req: RefundVerifyRequest):
+    """
+    The whole decision hinges on transaction_id:
+      1. Look up what was sold under this transaction (barcode + stored image).
+      2. Resolve the product name (from MOCK_DB by barcode).
+      3. Match the customer's uploaded photo to the stored product image
+         (visual ORB) and/or OCR the product name from it.
+      4. Cross-check the stated product name against what was sold.
+      -> refund_possible = product exists for this txn AND the photo matches.
+    """
+    out = {"transaction_id": req.transaction_id, "refund_possible": False, "reason": None, "message": None}
+
+    # 1. Transaction lookup (the anchor).
+    stored_b64, barcode = None, None
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT barcode, image_b64 FROM checkout_images WHERE transaction_id = $1 "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    req.transaction_id,
+                )
+            if row:
+                barcode, stored_b64 = row["barcode"], row["image_b64"]
+        except Exception as e:
+            print(f"[verify-refund] transaction lookup failed: {e}")
+            out["reason"] = "lookup_error"
+            out["message"] = "I couldn't access the transaction records right now. Please try again shortly."
+            return out
+
+    if barcode is None and stored_b64 is None:
+        out["reason"] = "transaction_not_found"
+        out["message"] = (f"No purchase was found for transaction {req.transaction_id}. "
+                          f"Refund not possible — please double-check the transaction ID on your receipt.")
+        return out
+
+    # 2. Resolve the product that was sold.
+    try:
+        from ai_core import MOCK_DB
+    except Exception:
+        MOCK_DB = {}
+    sold = MOCK_DB.get(barcode) if barcode else None
+    sold_name = sold["product_name"] if sold else None
+    out["product_name"] = sold_name or req.product_name
+
+    # 3. We need the customer's photo to match against the purchase.
+    up = None
+    if req.image_b64:
+        try:
+            up = _decode_image(req.image_b64)
+        except Exception:
+            up = None
+    if up is None:
+        out["reason"] = "no_image"
+        out["message"] = "Please upload a clear photo of the product so I can match it to your purchase."
+        return out
+
+    # Visual match (uploaded photo vs the image stored at checkout for this txn).
+    visual = 0.0
+    if stored_b64:
+        try:
+            visual = _image_similarity(up, _decode_image(stored_b64))
+        except Exception:
+            visual = 0.0
+
+    # OCR the photo and fuzzy-match it against the product name sold in this txn.
+    ocr_score = 0.0
+    name_target = sold_name or req.product_name
+    if name_target:
+        texts = _ocr_texts(up)
+        if texts:
+            ocr_score = max((fuzz.token_set_ratio(name_target.lower(), t.lower()) for t in texts), default=0) / 100.0
+
+    # Stated product name vs the name actually sold (cross-check).
+    name_match = True
+    if req.product_name and sold_name:
+        name_match = (fuzz.token_set_ratio(req.product_name.lower(), sold_name.lower()) / 100.0) >= REFUND_NAME_MATCH
+
+    image_matched = (visual >= REFUND_VISUAL_MATCH) or (ocr_score >= REFUND_OCR_MATCH)
+    out.update({"visual_score": visual, "ocr_name_score": round(ocr_score, 3),
+                "name_match": name_match, "barcode": barcode})
+
+    # 4. Decide.
+    if image_matched and name_match:
+        out["refund_possible"] = True
+        out["reason"] = "verified"
+        out["message"] = (f"Refund possible — the photo matches "
+                          f"{out['product_name'] or 'the purchased item'} from transaction {req.transaction_id}.")
+    elif not name_match:
+        out["reason"] = "product_name_mismatch"
+        out["message"] = (f"Refund not possible — the product name you gave doesn't match what was bought in "
+                          f"transaction {req.transaction_id}" + (f" ({sold_name})" if sold_name else "") + ".")
+    else:
+        out["reason"] = "image_mismatch"
+        out["message"] = (f"Refund not possible — the uploaded photo doesn't match the product purchased in "
+                          f"transaction {req.transaction_id}" + (f" ({sold_name})" if sold_name else "") + ".")
+    return out
 
 
 # ── POST /verify — called by Node.js checkout gateway ─────────────────────────
