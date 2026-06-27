@@ -115,6 +115,7 @@ class MatchRequest(BaseModel):
     barcode_ocr:   Optional[str] = ""
     yolo_label:    Optional[str] = ""
     image_b64:     Optional[str] = None   # base64 image — triggers YOLO inference
+    mk_id:         Optional[str] = None   # manufacturer serial — validated at checkout
 
 
 class AuditImage(BaseModel):
@@ -962,7 +963,7 @@ async def match_verify(req: MatchRequest):
     elif fraud_risk > 0.55:
         fraud_type = "LOW_CONFIDENCE"
 
-    return {
+    result = {
         "found":          True,
         "match":          fraud_risk <= 0.5,
         "confidence":     max(0, 100 - int(fraud_risk * 100)),
@@ -974,6 +975,30 @@ async def match_verify(req: MatchRequest):
         "barcode_format": product["barcode_format"],
         "yolo_label":     yolo_label or None,
     }
+
+    # ── MK-ID (manufacturer serial) validation — counterfeit / swapped-unit check ──
+    # The barcode + image may match the genuine product, but a SWAPPED/incorrect
+    # MK-ID means this physical unit isn't a genuine serial. Only enforce when we
+    # actually know the valid serials for this barcode (product_catalog); this is
+    # a lightweight import (no YOLO/EasyOCR).
+    if req.mk_id:
+        from product_catalog import validate_mk_id, is_known_barcode
+        result["mk_id"] = req.mk_id
+        if is_known_barcode(req.barcode_value):
+            valid = validate_mk_id(req.barcode_value, req.mk_id)
+            result["mk_id_valid"] = valid
+            if not valid:
+                result["match"]      = False
+                result["confidence"] = 0
+                result["fraud_type"] = "MK_ID_MISMATCH"
+                result["message"]    = (f"MK ID '{req.mk_id}' is not a valid serial for "
+                                        f"{product['product_name']} (barcode {req.barcode_value}) — "
+                                        f"possible counterfeit or swapped unit.")
+        else:
+            # No serial list for this barcode → the MK-ID can't be verified.
+            result["mk_id_valid"] = None
+
+    return result
 
 
 # ── GET /inventory ─────────────────────────────────────────────────────────────
