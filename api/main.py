@@ -19,6 +19,7 @@ from rapidfuzz import fuzz
 from dotenv import load_dotenv
 import redis.asyncio as aioredis
 from datetime import datetime
+import re
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
 import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
@@ -318,6 +319,43 @@ def recognize_mk_id(img, provided_mk_id=None, provided_barcode=None):
     return None, None, "unrecognized"
 
 
+def _norm_mkid(s):
+    """Normalise an MK-ID for fuzzy comparison: uppercase, alphanumerics only."""
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+
+def _lev(a, b):
+    """Levenshtein edit distance between two short strings."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _closest_mkid(candidate, mk_id_set):
+    """Return the MK-ID from mk_id_set that the (possibly mis-OCR'd) candidate
+    refers to: an exact normalised match, or one within a single character of
+    edit distance (handles classic OCR slips like O<->0, I<->1). Else None."""
+    cn = _norm_mkid(candidate)
+    if not cn:
+        return None
+    best, best_d = None, 99
+    for mk in mk_id_set:
+        d = _lev(cn, _norm_mkid(mk))
+        if d < best_d:
+            best, best_d = mk, d
+    return best if best_d <= 1 else None
+
+
 # ── Transaction-anchored refund matching thresholds (env-overridable) ─────────
 REFUND_VISUAL_MATCH = float(os.getenv("REFUND_VISUAL_MATCH", "0.12"))  # ORB good-match ratio
 REFUND_OCR_MATCH    = float(os.getenv("REFUND_OCR_MATCH", "0.60"))     # OCR text vs product name
@@ -610,6 +648,21 @@ async def refund_pickup(req: RefundPickupRequest):
                 matched_barcode = bc
                 out["matched"] = True
                 break
+
+    # Tolerant fallback: OCR may misread a character (O<->0, I<->1, lost hyphen).
+    # If we have a recognised MK-ID and the transaction has MK-IDs, accept a
+    # near-match (edit distance <= 1) against this transaction's own MK-IDs.
+    if not out["matched"] and mk_id and txn_mk_ids:
+        canon = _closest_mkid(mk_id, txn_mk_ids)
+        if canon:
+            mk_id = canon
+            out["recognized_mk_id"] = canon
+            out["recognition_method"] = (method or "ocr_mk_id") + "+fuzzy"
+            for r in txn_rows:
+                if (r.get("mk_id") or "").upper() == canon:
+                    matched_barcode = r.get("barcode")
+                    break
+            out["matched"] = True
 
     product      = MOCK_DB.get(matched_barcode) if matched_barcode else None
     product_name = (product["product_name"] if product else None) or req.product_name

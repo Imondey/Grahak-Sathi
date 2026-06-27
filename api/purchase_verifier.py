@@ -19,16 +19,44 @@ import re
 
 # MK-IDs look like "MK-MILO-2024-A001" / "MK-NVA-2024-C301".
 MK_ID_RE = re.compile(r"MK-[A-Z0-9]+-\d{4}-[A-Z0-9]+", re.IGNORECASE)
+# Tolerant variants: OCR frequently drops/mangles the hyphens or splits the
+# serial across boxes, so we also accept the parts with arbitrary separators.
+MK_ID_LOOSE_RE   = re.compile(r"MK[\s\-]*([A-Z]{2,})[\s\-]*(\d{4})[\s\-]*([A-Z][A-Z0-9]+)")
+MK_ID_SQUASH_RE  = re.compile(r"MK([A-Z]{2,})(\d{4})([A-Z]\d{2,4})")
 # A plain product barcode (UPC-A / EAN-13).
 BARCODE_RE = re.compile(r"\b\d{12,13}\b")
 
 
 def extract_mk_id_from_texts(texts) -> Optional[str]:
-    """Find the first MK-ID pattern in a list of OCR text fragments."""
-    for t in texts or []:
-        m = MK_ID_RE.search((t or "").upper().replace(" ", ""))
+    """Find an MK-ID in OCR text fragments.
+
+    OCR often splits a serial across boxes or drops the hyphens, so we try, in
+    order of confidence:
+      1. a strict match inside any single fragment;
+      2. a tolerant match over all fragments joined together (separators may be
+         missing/misread), reconstructing the canonical MK-CODE-YYYY-SUFFIX form;
+      3. the same with every non-alphanumeric character removed.
+    """
+    frags = [(t or "").upper() for t in (texts or [])]
+
+    # 1) strict, per fragment
+    for t in frags:
+        m = MK_ID_RE.search(t.replace(" ", ""))
         if m:
             return m.group(0)
+
+    # 2) tolerant over the whole read (keeps fragment gaps as separators)
+    joined = " ".join(frags)
+    m = MK_ID_LOOSE_RE.search(joined)
+    if m:
+        return f"MK-{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+    # 3) last resort: strip all separators ("MKMILO2024A001")
+    squashed = re.sub(r"[^A-Z0-9]", "", joined)
+    m = MK_ID_SQUASH_RE.search(squashed)
+    if m:
+        return f"MK-{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
     return None
 
 

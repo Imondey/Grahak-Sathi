@@ -97,8 +97,12 @@ function toDataUrl(file) {
         console.log('  The chatbot extracts the MK-ID from your photo (or uses the one you type) and');
         console.log('  matches it against the transaction. On a match it replies:');
         console.log('      "Refund request done and pickup initiated."\n');
-        console.log('  Tip: if OCR can\'t read an MK-ID from the sample photo, just enter the MK-ID');
-        console.log(`       above in the chatbot's MK-ID field to complete the match.\n`);
+        console.log('  Tip: the sample photos have no MK-ID printed on them, so to test the OCR');
+        console.log('       path, first stamp the MK-ID onto a photo, then upload THAT image:');
+        console.log(`         python tools/make_mkid_label.py --mk-id ${MK_ID} \\`);
+        console.log('             --base samples/product_intact.jpg \\');
+        console.log('             --out  samples/product_intact_mkid.jpg --product "Nestle Milo 500g"');
+        console.log('       (or just type the MK-ID in the chatbot MK-ID field to skip OCR.)\n');
     } catch (err) {
         console.error('❌ Seeding failed:', err.message);
         console.error('   • Did you run db/migration_otari.sql first?');
