@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from datetime import datetime
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
+import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
 
 load_dotenv()
 
@@ -134,6 +135,15 @@ class InjectionCheckRequest(BaseModel):
     text: str
 
 
+class PurchaseVerifyRequest(BaseModel):
+    """Anti-fraud: verify the complained product is in the user's purchase history."""
+    user_id:        str                          # customer identifier
+    mk_id:          Optional[str] = None         # explicit MK-ID (if scanned/typed)
+    barcode:        Optional[str] = None         # explicit barcode (alternative key)
+    image_b64:      Optional[str] = None         # complaint photo — OCR'd for the MK-ID/barcode
+    complaint_text: Optional[str] = None
+
+
 # ── HELPER ─────────────────────────────────────────────────────────────────────
 def compute_fraud_risk(db_product: Optional[dict], yolo_label: str, ocr_text: str) -> float:
     """
@@ -237,6 +247,46 @@ def run_yolo_detailed(img) -> list[dict]:
 AUDIT_INTACT_THRESHOLD = float(os.getenv("AUDIT_INTACT_THRESHOLD", "0.55"))
 
 
+# Lazy EasyOCR reader (heavy) — only initialised the first time we OCR a photo.
+_ocr_reader = None
+
+
+def _ocr_texts(img) -> list[str]:
+    """Read text fragments from an image (used to recover the MK-ID/barcode).
+    Fails soft to [] if EasyOCR isn't installed or inference errors."""
+    global _ocr_reader
+    if img is None:
+        return []
+    try:
+        if _ocr_reader is None:
+            import easyocr
+            _ocr_reader = easyocr.Reader(["en"], gpu=False)
+        return [t for (_b, t, c) in _ocr_reader.readtext(img) if c and c > 0.3]
+    except Exception as e:
+        print(f"[recognize] OCR unavailable ({e})")
+        return []
+
+
+def recognize_mk_id(img, provided_mk_id=None, provided_barcode=None):
+    """
+    Recognise the product identity for a complaint photo.
+    Order: explicit MK-ID > explicit barcode > OCR the photo for an MK-ID/barcode.
+    Returns (mk_id, barcode, method).
+    """
+    if provided_mk_id:
+        return provided_mk_id.strip().upper(), (provided_barcode or None), "provided_mk_id"
+    if provided_barcode:
+        return None, provided_barcode.strip(), "provided_barcode"
+    texts = _ocr_texts(img)
+    mk = purchase_verifier.extract_mk_id_from_texts(texts)
+    if mk:
+        return mk, None, "ocr_mk_id"
+    bc = purchase_verifier.extract_barcode_from_texts(texts)
+    if bc:
+        return None, bc, "ocr_barcode"
+    return None, None, "unrecognized"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +330,28 @@ async def injection_check(req: InjectionCheckRequest):
         return {"available": injection_model.is_ready(), "injection": False,
                 "score": 0.0, "confidence": 0.0, "label": "safe"}
     return injection_model.predict(text)
+
+
+# ── POST /audit/verify-purchase — anti-fraud purchase-history check ───────────
+@app.post("/audit/verify-purchase")
+async def verify_purchase(req: PurchaseVerifyRequest):
+    """
+    Recognise the product in the complaint photo (or use a provided MK-ID/barcode)
+    and verify it exists in the user's purchase history. Mirrors the reference
+    flow: recognise -> look up user -> cross-reference -> APPROVED / REJECTED.
+    """
+    img = None
+    if req.image_b64 and not (req.mk_id or req.barcode):
+        try:
+            img = _decode_image(req.image_b64)
+        except Exception:
+            img = None
+    mk_id, barcode, method = recognize_mk_id(img, req.mk_id, req.barcode)
+    result = await purchase_verifier.verify_complaint(db_pool, req.user_id, mk_id, barcode)
+    result["recognized_mk_id"] = mk_id
+    result["recognized_barcode"] = barcode
+    result["recognition_method"] = method
+    return result
 
 
 # ── POST /verify — called by Node.js checkout gateway ─────────────────────────
