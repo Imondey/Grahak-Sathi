@@ -579,11 +579,23 @@ async def refund_pickup(req: RefundPickupRequest):
     if db_pool is not None:
         try:
             async with db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT mk_id, barcode FROM checkout_images WHERE transaction_id = $1 "
-                    "ORDER BY created_at DESC",
-                    req.transaction_id,
-                )
+                try:
+                    rows = await conn.fetch(
+                        "SELECT mk_id, barcode FROM checkout_images WHERE transaction_id = $1 "
+                        "ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
+                except Exception as col_err:
+                    # The mk_id column may not exist yet (migration_refund_mkid.sql
+                    # not applied). Degrade to a barcode-only lookup so the flow
+                    # still works via the product catalogue (MOCK_DB serials).
+                    print(f"[refund-pickup] mk_id column unavailable, falling back to "
+                          f"barcode-only lookup: {col_err}")
+                    rows = await conn.fetch(
+                        "SELECT barcode FROM checkout_images WHERE transaction_id = $1 "
+                        "ORDER BY created_at DESC",
+                        req.transaction_id,
+                    )
             txn_rows = [dict(r) for r in rows]
         except Exception as e:
             print(f"[refund-pickup] transaction lookup failed: {e}")

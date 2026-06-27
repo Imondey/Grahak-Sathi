@@ -74,6 +74,41 @@ function toDataUrl(file) {
     try {
         await db.connect();
 
+        // Ensure the schema this seeder needs exists (idempotent). This means a
+        // forgotten `migration_refund_mkid.sql` no longer breaks seeding or the
+        // refund-pickup lookup — the mk_id column is guaranteed to be present.
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS checkout_images (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id TEXT NOT NULL,
+                shop_id INTEGER,
+                barcode TEXT,
+                image_b64 TEXT NOT NULL,
+                mk_id TEXT,
+                purchase_channel TEXT NOT NULL DEFAULT 'offline',
+                return_eligible_until TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            ALTER TABLE checkout_images ADD COLUMN IF NOT EXISTS mk_id TEXT;
+            ALTER TABLE checkout_images ADD COLUMN IF NOT EXISTS purchase_channel TEXT NOT NULL DEFAULT 'offline';
+            ALTER TABLE checkout_images ADD COLUMN IF NOT EXISTS return_eligible_until TIMESTAMPTZ;
+            CREATE INDEX IF NOT EXISTS idx_checkout_images_txn      ON checkout_images (transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_checkout_images_txn_mkid ON checkout_images (transaction_id, mk_id);
+            CREATE INDEX IF NOT EXISTS idx_checkout_images_mkid     ON checkout_images (mk_id);
+
+            CREATE TABLE IF NOT EXISTS delivery_images (
+                id BIGSERIAL PRIMARY KEY,
+                transaction_id TEXT NOT NULL,
+                shop_id INTEGER,
+                barcode TEXT,
+                image_b64 TEXT NOT NULL,
+                courier TEXT,
+                delivered_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_delivery_images_txn ON delivery_images (transaction_id);
+        `);
+
         const txnIds = PRODUCTS.map(p => p.transaction);
 
         // Idempotent: clear any previous demo rows for these IDs.
@@ -120,7 +155,8 @@ function toDataUrl(file) {
         console.log('  then upload the *_mkid.jpg image (or just type the MK-ID in the chatbot).\n');
     } catch (err) {
         console.error('❌ Seeding failed:', err.message);
-        console.error('   • Did you run db/migration_otari.sql and db/migration_refund_mkid.sql first?');
+        console.error('   • Is PostgreSQL running and reachable with the DB_* env vars (same as index.js)?');
+        console.error('   • Does the FastAPI service use the SAME database (DATABASE_URL) as this seeder?');
         console.error('   • Are samples/milo.jpg and samples/colgate.jpg present in ./samples/ ?');
         process.exitCode = 1;
     } finally {
