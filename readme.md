@@ -522,6 +522,33 @@ This creates two transactions:
 
 ---
 
+## Security — Prompt-Injection Protection
+
+The support chatbot is protected by a two-stage, evasion-resistant defence (no
+change to normal chat behaviour — legitimate messages are never newly blocked):
+
+- **Stage 1 — regex (`lib/injectionFilter.js`)**: sub-millisecond rule pass over
+  12 pattern families (instruction-override, role-hijack, prompt-leak,
+  reveal-context, force-authorise, bypass-verification, fake-authority,
+  delimiter-injection, override-policy, jailbreak/DAN, new-instructions,
+  exfil/exec). A hit blocks with **zero** model spend. Hardened against evasions
+  by matching every rule across normalised variants of the input:
+  Unicode **NFKC** + zero-width/soft-hyphen stripping (`ｉgnore`, `ig‌nore`),
+  **de-spacing** (`i g n o r e` → `ignore`), and **base64 decode-and-rescan**.
+- **Stage 2 — self-hosted LSTM (`api/injection_model.py`, `POST /security/injection-check`)**:
+  a local PyTorch classifier (no external AI), retail-aware so normal return
+  queries aren't flagged. **Fails open** — Stage 1 still protects if torch is absent.
+- **LLM hardening**: the FAQ-fallback and intent-parse system prompts treat the
+  user message as **untrusted data** (never follow it, reveal the prompt, or
+  authorise anything); an **output guard** suppresses any reply that looks like a
+  leaked system prompt.
+
+**Backstop:** refund/authorisation decisions are made by the verification path,
+**never by the LLM** — so a payload cannot itself authorise a refund.
+
+Test it: `npm run test:injection` (attacks incl. spacing/zero-width/full-width/base64
+blocked; legitimate retail messages allowed).
+
 ## Team
 
 Built by **Team Schrodinger** for **HackArena 2.0**.
