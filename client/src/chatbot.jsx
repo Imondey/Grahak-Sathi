@@ -345,7 +345,7 @@ export default function ChatbotPage({ user }) {
           {imageB64 && (
             <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8, padding:'6px 10px', borderRadius:10, background:'rgba(109,40,217,.07)', border:'1px solid rgba(109,40,217,.25)' }}>
               <img src={imageB64} alt="product" style={{ width:40, height:40, objectFit:'cover', borderRadius:8 }} />
-              <span style={{ fontSize:11, color:'#c4b5fd', flex:1 }}>Product photo attached — I'll read its MK-ID and match it to your transaction when you send.</span>
+              <span style={{ fontSize:11, color:'#c4b5fd', flex:1 }}>Product photo attached — I'll check it for damage and match it to your transaction when you send.</span>
               <button onClick={() => { setImageB64(null); if (fileRef.current) fileRef.current.value='' }} title="Remove photo" style={{ background:'transparent', border:'none', color:'#fb923c', cursor:'pointer', fontSize:14 }}>✕</button>
             </div>
           )}
