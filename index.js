@@ -37,8 +37,10 @@ const { RedisStore } = require('connect-redis');
 const aiConfig                = require('./lib/aiConfig');
 const modelRouter             = require('./lib/modelRouter');
 const injectionFilter         = require('./lib/injectionFilter');
+const knowledgeBase           = require('./lib/knowledgeBase');
 const { createBudgetEngine }  = require('./lib/budgetEngine');
 const { createAuditor }       = require('./lib/auditor');
+const { createCustomerAssistant } = require('./lib/customerAssistant');
 
 const app         = express();
 const PORT        = process.env.PORT || 3000;
@@ -150,6 +152,73 @@ const auditor = createAuditor({
     logUsage,
     logInjection,
     getCheckoutImage,
+});
+
+// ── Grounded retrieval helpers for the general customer assistant ──────────────
+// Live product lookup from the real inventory (proves the bot isn't just an LLM).
+async function lookupProduct(shopId, terms) {
+    if (shopId == null || !Array.isArray(terms) || terms.length === 0) return [];
+    const patterns = terms.map(t => `%${t}%`);
+    try {
+        const r = await db.query(
+            `SELECT product_name, price, quantity, barcode
+               FROM products
+              WHERE shop_id = $1 AND product_name ILIKE ANY($2::text[])
+              ORDER BY product_name
+              LIMIT 5`,
+            [shopId, patterns]
+        );
+        return r.rows;
+    } catch (err) {
+        if (!lookupProduct._warned) { console.warn('product lookup skipped:', err.message); lookupProduct._warned = true; }
+        return [];
+    }
+}
+
+// Order / claim status lookup from the DB (return_claims first, then transactions).
+async function lookupOrder(shopId, transactionId) {
+    const txn = String(transactionId || '').trim();
+    if (!txn) return null;
+    try {
+        const c = await db.query(
+            `SELECT decision, intent, claim_type, created_at
+               FROM return_claims
+              WHERE transaction_id = $1
+              ORDER BY created_at DESC LIMIT 1`,
+            [txn]
+        );
+        if (c.rows.length > 0) return { type: 'claim', ...c.rows[0] };
+    } catch (err) {
+        if (!lookupOrder._warnedC) { console.warn('claim lookup skipped:', err.message); lookupOrder._warnedC = true; }
+    }
+    // Fallback: treat the value as a barcode against this shop's transactions.
+    try {
+        const t = await db.query(
+            `SELECT product_name, status, scanned_at
+               FROM transactions
+              WHERE shop_id = $1 AND barcode = $2
+              ORDER BY scanned_at DESC LIMIT 1`,
+            [shopId, txn]
+        );
+        if (t.rows.length > 0) return { type: 'transaction', ...t.rows[0] };
+    } catch (err) {
+        if (!lookupOrder._warnedT) { console.warn('transaction lookup skipped:', err.message); lookupOrder._warnedT = true; }
+    }
+    return null;
+}
+
+const assistant = createCustomerAssistant({
+    kb:         knowledgeBase,
+    injection:  injectionFilter,
+    router:     modelRouter,
+    budget:     budgetEngine,
+    auditor,
+    groqClient,
+    hasGroqKey: HAS_GROQ_KEY,
+    lookupProduct,
+    lookupOrder,
+    logUsage,
+    logInjection,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1164,6 +1233,50 @@ app.post('/api/chatbot/audit', async (req, res) => {
     } catch (err) {
         console.error('Chatbot audit error:', err.message);
         return res.status(500).json({ message: 'Auditor error. Please try again.' });
+    }
+});
+
+// POST /api/chatbot/ask — General-purpose hybrid Customer Assistant (public).
+// NOT a pure LLM wrapper: rule-based intent + knowledge base + live DB lookups,
+// delegating refund claims to the visual auditor and using the LLM only as a
+// grounded, budget-gated fallback (with human handoff when out of scope).
+app.post('/api/chatbot/ask', async (req, res) => {
+    const { message, transaction_id, image_b64 } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim())
+        return res.status(400).json({ message: 'A message is required.' });
+    if (message.length > 4000)
+        return res.status(413).json({ message: 'Message too long.' });
+
+    const sessionId = budgetSessionId(req);
+    const shopId    = req.session?.user?.id || null;
+
+    try {
+        const result = await assistant.handle({
+            sessionId,
+            shopId,
+            message: message.trim(),
+            transactionId: transaction_id ?? null,
+            imageB64: image_b64 || null,
+        });
+
+        // Persist refund-claim outcomes (when the assistant delegated to the auditor).
+        if (['APPROVED', 'DENIED', 'NEEDS_REVIEW'].includes(result.decision)) {
+            db.query(
+                `INSERT INTO return_claims
+                   (session_id, shop_id, transaction_id, intent, claim_type, decision, confidence, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+                [sessionId, shopId, transaction_id ?? null, result.intent,
+                 result.verification?.claim_type || null, result.decision,
+                 result.verification?.confidence ?? null]
+            ).catch(err => {
+                if (!app._askClaimWarned) { console.warn('return_claims insert skipped:', err.message); app._askClaimWarned = true; }
+            });
+        }
+
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Chatbot ask error:', err.message);
+        return res.status(500).json({ message: 'Assistant error. Please try again.' });
     }
 });
 
