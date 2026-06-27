@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 import redis.asyncio as aioredis
 from datetime import datetime
 
+import injection_model   # local self-hosted LSTM prompt-injection classifier
+
 load_dotenv()
 
 app = FastAPI(title="SmartRetail Verification Engine", version="1.0.0")
@@ -60,6 +62,15 @@ async def startup():
     except Exception as e:
         print(f"⚠️  YOLO load failed ({e}) — running without visual verification")
 
+    # Train/load the local prompt-injection LSTM (Stage-2 classifier).
+    try:
+        if injection_model.load_or_train():
+            print("✅ Prompt-injection LSTM ready (Stage-2 security classifier)")
+        else:
+            print("⚠️  Prompt-injection LSTM disabled (torch not installed)")
+    except Exception as e:
+        print(f"⚠️  Injection model init failed ({e}) — Stage-2 classifier disabled")
+
 @app.on_event("shutdown")
 async def shutdown():
     if db_pool:    await db_pool.close()
@@ -86,6 +97,11 @@ class AuditClaimRequest(BaseModel):
     checkout_image_b64: Optional[str] = None    # the live image saved at checkout
     transaction_id:     Optional[str] = None
     reference_label:    Optional[str] = None    # expected product (from inventory)
+
+
+class InjectionCheckRequest(BaseModel):
+    """Stage-2 prompt-injection classification request."""
+    text: str
 
 
 # ── HELPER ─────────────────────────────────────────────────────────────────────
@@ -198,9 +214,32 @@ async def health():
             await conn.fetchval("SELECT 1")
         await redis_pool.ping()
         yolo_status = "loaded" if yolo_model is not None else "not_loaded"
-        return {"db": "connected", "redis": "connected", "yolo": yolo_status}
+        return {
+            "db": "connected",
+            "redis": "connected",
+            "yolo": yolo_status,
+            "injection_lstm": "ready" if injection_model.is_ready() else "disabled",
+        }
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+# ── POST /security/injection-check — Stage-2 LSTM prompt-injection classifier ──
+@app.post("/security/injection-check")
+async def injection_check(req: InjectionCheckRequest):
+    """
+    Self-hosted Stage-2 classifier. The Node gateway calls this after its fast
+    regex Stage-1 pass. Returns whether the input is a prompt-injection attempt,
+    the model's probability score, and the decision threshold used.
+
+    Fails soft: if torch/the model is unavailable, returns available=false so the
+    caller can fail-open (Stage-1 regex still protects the system).
+    """
+    text = (req.text or "").strip()
+    if not text:
+        return {"available": injection_model.is_ready(), "injection": False,
+                "score": 0.0, "confidence": 0.0, "label": "safe"}
+    return injection_model.predict(text)
 
 
 # ── POST /verify — called by Node.js checkout gateway ─────────────────────────

@@ -140,6 +140,20 @@ async function getCheckoutImage(transactionId) {
     return null;
 }
 
+// Stage-2 prompt-injection classifier — calls the self-hosted LSTM on FastAPI.
+// Fails OPEN (returns null) so a model/FastAPI hiccup never blocks the chatbot;
+// the Stage-1 regex filter still protects the system.
+async function classifyInjection(text) {
+    try {
+        const r = await axios.post(`${FASTAPI_URL}/security/injection-check`,
+            { text }, { timeout: 4000 });
+        return r.data;   // { available, injection, score, confidence, label }
+    } catch (err) {
+        if (!classifyInjection._warned) { console.warn('injection-check unavailable (fail-open):', err.message); classifyInjection._warned = true; }
+        return null;
+    }
+}
+
 const auditor = createAuditor({
     llm:        otari,
     axios,
@@ -147,6 +161,7 @@ const auditor = createAuditor({
     budget:     budgetEngine,
     router:     modelRouter,
     injection:  injectionFilter,
+    classifyInjection,
     logUsage,
     logInjection,
     getCheckoutImage,
@@ -212,6 +227,7 @@ const assistant = createCustomerAssistant({
     budget:     budgetEngine,
     auditor,
     llm:        otari,
+    classifyInjection,
     lookupProduct,
     lookupOrder,
     logUsage,

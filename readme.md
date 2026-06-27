@@ -128,8 +128,10 @@ npm install
 ### 2. Install Python Dependencies
 
 ```bash
-pip install fastapi uvicorn asyncpg rapidfuzz python-dotenv redis aioredis ultralytics opencv-python numpy easyocr thefuzz
+pip install fastapi uvicorn asyncpg rapidfuzz python-dotenv redis aioredis ultralytics opencv-python numpy easyocr thefuzz torch
 ```
+
+> `torch` powers the self-hosted prompt-injection LSTM (Stage-2 security classifier, served at `POST /security/injection-check`). If torch isn't installed the model is skipped and the gateway falls back to the Stage-1 regex filter.
 
 ### 3. Configure Environment
 
