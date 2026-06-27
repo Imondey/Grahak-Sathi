@@ -58,6 +58,21 @@ export default function ChatbotPage({ user }) {
   const [txnId, setTxnId]   = useState('')
   const [sending, setSending] = useState(false)
   const [budget, setBudget] = useState(null)
+  const [imageB64, setImageB64] = useState(null)
+  const fileRef = useRef(null)
+
+  function onPickImage(e) {
+    const file = e.target.files && e.target.files[0]
+    if (!file) return
+    if (file.size > 8 * 1024 * 1024) {
+      setMessages(m => [...m, { role: 'bot', text: 'That image is too large (max 8 MB). Please choose a smaller photo.' }])
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => setImageB64(reader.result)
+    reader.readAsDataURL(file)
+  }
 
   const refreshBudget = useCallback(async () => {
     try {
@@ -79,9 +94,12 @@ export default function ChatbotPage({ user }) {
   }, [messages, sending])
 
   async function send(override) {
-    const text = (typeof override === 'string' ? override : input).trim()
+    let text = (typeof override === 'string' ? override : input).trim()
+    // Allow starting a refund with just an attached photo (no typed text).
+    if (!text && imageB64) text = 'I want a refund — here is a photo of the product.'
     if (!text || sending) return
-    setMessages(m => [...m, { role: 'user', text }])
+    const attached = imageB64
+    setMessages(m => [...m, { role: 'user', text: attached ? `${text} 📷` : text }])
     setInput('')
     setSending(true)
     try {
@@ -93,6 +111,7 @@ export default function ChatbotPage({ user }) {
           message: text,
           transaction_id: txnId.trim() || null,
           budget_session: budgetSession.current,
+          image_b64: attached || null,
         }),
       })
       const data = await r.json()
@@ -114,6 +133,8 @@ export default function ChatbotPage({ user }) {
       setMessages(m => [...m, { role: 'bot', text: 'Connection error. Please try again.' }])
     } finally {
       setSending(false)
+      setImageB64(null)
+      if (fileRef.current) fileRef.current.value = ''
       refreshBudget()
     }
   }
@@ -249,11 +270,13 @@ export default function ChatbotPage({ user }) {
                     {m.verification.channel === 'online' ? '🚚 Online order' : '🏪 In-store purchase'}
                   </span>
                   {Array.isArray(m.verification.images) && m.verification.images.map((img, j) => {
-                    const label = img.source === 'delivery' ? 'Delivery DB' : (img.source === 'product' || img.source === 'checkout') ? 'Product DB' : img.source
+                    const label = img.source === 'delivery' ? 'Delivery DB'
+                      : img.source === 'customer' ? 'Uploaded photo'
+                      : (img.source === 'product' || img.source === 'checkout') ? 'Product DB' : img.source
                     const ok = img.intact === true
                     const bad = img.intact === false
                     const color = ok ? '#34d399' : bad ? '#f87171' : '#94a3b8'
-                    const verdict = ok ? 'seal intact' : bad ? 'seal compromised' : 'inconclusive'
+                    const verdict = ok ? 'intact' : bad ? 'damaged' : 'inconclusive'
                     return (
                       <span key={j} title={img.top_label ? `detected: ${img.top_label} (${Math.round((img.top_conf||0)*100)}%)` : undefined}
                         style={{ fontSize:8.5, fontFamily:'monospace', padding:'2px 7px', borderRadius:6, color, border:`1px solid ${color}44`, background:`${color}11` }}>
@@ -293,15 +316,25 @@ export default function ChatbotPage({ user }) {
               style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:10, color:'#e9d5ff', fontFamily:'monospace', fontSize:11.5, padding:'9px 13px', outline:'none' }} />
             <button onClick={resetBudget} title="Start a fresh session budget" style={{ padding:'9px 14px', borderRadius:10, fontSize:11, border:'1px solid rgba(109,40,217,.3)', background:'transparent', color:'#6d28d9', cursor:'pointer', whiteSpace:'nowrap' }}>↺ New session</button>
           </div>
+          {imageB64 && (
+            <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8, padding:'6px 10px', borderRadius:10, background:'rgba(109,40,217,.07)', border:'1px solid rgba(109,40,217,.25)' }}>
+              <img src={imageB64} alt="product" style={{ width:40, height:40, objectFit:'cover', borderRadius:8 }} />
+              <span style={{ fontSize:11, color:'#c4b5fd', flex:1 }}>Product photo attached — I'll check it for damage when you send.</span>
+              <button onClick={() => { setImageB64(null); if (fileRef.current) fileRef.current.value='' }} title="Remove photo" style={{ background:'transparent', border:'none', color:'#fb923c', cursor:'pointer', fontSize:14 }}>✕</button>
+            </div>
+          )}
           <div style={{ display:'flex', gap:8 }}>
+            <input type="file" ref={fileRef} accept="image/*" onChange={onPickImage} style={{ display:'none' }} />
+            <button onClick={() => fileRef.current && fileRef.current.click()} disabled={sending} title="Upload a product photo for a refund"
+              style={{ padding:'13px 15px', borderRadius:12, border:'1px solid rgba(109,40,217,.3)', background:'rgba(109,40,217,.07)', color:'#a78bfa', cursor: sending?'not-allowed':'pointer', fontSize:16, opacity: sending?.5:1 }}>📷</button>
             <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') send() }}
               placeholder="Ask a question, or describe an issue with your order…" disabled={sending}
               style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:12, color:'#e9d5ff', fontFamily:"'Sora',sans-serif", fontSize:13.5, padding:'13px 16px', outline:'none' }} />
-            <button onClick={send} disabled={sending || !input.trim()} style={{
-              padding:'13px 22px', borderRadius:12, border:'none', cursor: sending||!input.trim()?'not-allowed':'pointer',
+            <button onClick={send} disabled={sending || (!input.trim() && !imageB64)} style={{
+              padding:'13px 22px', borderRadius:12, border:'none', cursor: sending||(!input.trim()&&!imageB64)?'not-allowed':'pointer',
               fontFamily:"'Sora',sans-serif", fontSize:13.5, fontWeight:700, color:'#fff',
               background:'linear-gradient(135deg,#7c3aed,#5b21b6)', boxShadow:'0 4px 20px rgba(124,58,237,.3)',
-              opacity: sending||!input.trim()?.5:1,
+              opacity: sending||(!input.trim()&&!imageB64)?.5:1,
             }}>Send</button>
           </div>
         </div>

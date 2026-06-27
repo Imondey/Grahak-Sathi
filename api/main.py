@@ -110,6 +110,7 @@ class AuditClaimRequest(BaseModel):
     channel:            Optional[str] = "offline"    # offline | online
     checkout_image_b64: Optional[str] = None         # product image at checkout/dispatch (a.k.a. Customer DB)
     delivery_image_b64: Optional[str] = None         # delivery photo (Delivery DB) — online only
+    customer_image_b64: Optional[str] = None         # photo the CUSTOMER uploads at refund time (current condition)
     images:             Optional[List[AuditImage]] = None  # generic multi-image alternative
     transaction_id:     Optional[str] = None
     reference_label:    Optional[str] = None         # expected product (from inventory)
@@ -480,6 +481,7 @@ def _collect_images(req: "AuditClaimRequest") -> list[dict]:
     if req.images:
         for im in req.images:
             add((im.source or "product").lower(), im.image_b64)
+    add("customer", req.customer_image_b64)
     add("product", req.checkout_image_b64)
     if (req.channel or "offline").lower() == "online":
         add("delivery", req.delivery_image_b64)
@@ -533,6 +535,7 @@ async def verify_claim(req: AuditClaimRequest):
         analyses.append(a)
 
     by_source = {a["source"]: a for a in analyses}
+    customer = by_source.get("customer")
     product  = by_source.get("product") or by_source.get("checkout")
     delivery = by_source.get("delivery")
 
@@ -559,6 +562,35 @@ async def verify_claim(req: AuditClaimRequest):
         return {"claim_supported": None, "confidence": 0.2, "channel": channel,
                 "finding": "The visual model could not confidently locate the product/seal in the "
                            "provided image(s) — manual review recommended.",
+                "images": analyses}
+
+    # ── PRIMARY: a photo the customer uploaded at refund time ─────────────────
+    # The decision is driven by whether THAT photo shows a damaged product:
+    #   damaged → claim supported → APPROVED ;  intact/undamaged → DENIED.
+    if customer is not None:
+        if not customer.get("model_available"):
+            return {"claim_supported": None, "confidence": 0.25, "channel": channel,
+                    "finding": "I couldn't clearly identify a product in the photo you uploaded. "
+                               "Please upload a clearer, well-lit photo of the item.",
+                    "images": analyses}
+        damaged = not customer["intact"]
+        if damaged:
+            note = ""
+            # If we also have the purchase image and it was intact, the damage is post-sale.
+            if product and product.get("model_available") and product["intact"]:
+                note = " It looked intact at purchase, so the damage appears to have occurred afterwards."
+            return {"claim_supported": True,
+                    "confidence": round(min(0.95, 1.0 - customer["top_conf"] + 0.2), 2),
+                    "channel": channel,
+                    "finding": f"The photo you uploaded shows the product is damaged / not in intact "
+                               f"condition (detection {round(customer['top_conf']*100)}%, "
+                               f"sharpness {round(customer['sharpness'])}).{note}",
+                    "images": analyses}
+        return {"claim_supported": False,
+                "confidence": round(min(0.99, customer["top_conf"]), 2), "channel": channel,
+                "finding": f"The photo you uploaded shows the product appears intact / undamaged "
+                           f"({customer['top_label']}, {round(customer['top_conf']*100)}% detection), "
+                           f"so the '{claim}' claim isn't supported.",
                 "images": analyses}
 
     if channel == "online":
