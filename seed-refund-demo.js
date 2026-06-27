@@ -33,6 +33,7 @@ const TXN_OFFLINE = process.env.DEMO_TXN_OFFLINE || '100000000001';
 const TXN_ONLINE  = process.env.DEMO_TXN_ONLINE  || '100000000002';
 const SHOP_ID     = parseInt(process.env.DEMO_SHOP_ID) || 1;
 const BARCODE     = process.env.DEMO_BARCODE || '8901030823437';  // Nestle Milo (in MOCK_DB)
+const MK_ID       = process.env.DEMO_MK_ID || 'MK-MILO-2024-A001'; // serial linked to the txn
 const RETURN_DAYS = parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
 
 const SAMPLES = path.join(__dirname, 'samples');
@@ -68,17 +69,17 @@ function toDataUrl(file) {
         // ── OFFLINE transaction: one product image (Customer DB) ──────────────
         await db.query(
             `INSERT INTO checkout_images
-               (transaction_id, shop_id, barcode, image_b64, purchase_channel, return_eligible_until, created_at)
-             VALUES ($1,$2,$3,$4,'offline', NOW() + ($5 || ' days')::interval, NOW())`,
-            [TXN_OFFLINE, SHOP_ID, BARCODE, toDataUrl(IMG.productOffline), String(RETURN_DAYS)]
+               (transaction_id, shop_id, barcode, image_b64, mk_id, purchase_channel, return_eligible_until, created_at)
+             VALUES ($1,$2,$3,$4,$5,'offline', NOW() + ($6 || ' days')::interval, NOW())`,
+            [TXN_OFFLINE, SHOP_ID, BARCODE, toDataUrl(IMG.productOffline), MK_ID, String(RETURN_DAYS)]
         );
 
         // ── ONLINE transaction: product (dispatch) + delivery photo ───────────
         await db.query(
             `INSERT INTO checkout_images
-               (transaction_id, shop_id, barcode, image_b64, purchase_channel, return_eligible_until, created_at)
-             VALUES ($1,$2,$3,$4,'online', NOW() + ($5 || ' days')::interval, NOW())`,
-            [TXN_ONLINE, SHOP_ID, BARCODE, toDataUrl(IMG.productOnline), String(RETURN_DAYS)]
+               (transaction_id, shop_id, barcode, image_b64, mk_id, purchase_channel, return_eligible_until, created_at)
+             VALUES ($1,$2,$3,$4,$5,'online', NOW() + ($6 || ' days')::interval, NOW())`,
+            [TXN_ONLINE, SHOP_ID, BARCODE, toDataUrl(IMG.productOnline), MK_ID, String(RETURN_DAYS)]
         );
         await db.query(
             `INSERT INTO delivery_images
@@ -88,16 +89,16 @@ function toDataUrl(file) {
         );
 
         console.log('\n✅ Refund demo data seeded.\n');
-        console.log('  Open the support chatbot, paste a Transaction ID, and say:');
-        console.log('  "I want a refund, the seal was broken."\n');
+        console.log('  Open the support chatbot, paste a Transaction ID, attach a product photo (or');
+        console.log('  type the MK-ID), and say: "I want a refund."\n');
         console.log(`  🏪  OFFLINE (in-store)  →  Transaction ID:  ${TXN_OFFLINE}`);
-        console.log('         checks the product image (Customer DB)\n');
         console.log(`  🚚  ONLINE  (delivered) →  Transaction ID:  ${TXN_ONLINE}`);
-        console.log('         checks the product image + delivery photo (Delivery DB)\n');
-        console.log('  Customer ID: USER_9921 (Alice) — owns MK-MILO-2024-A001 (Nestle Milo)');
-        console.log('  The OCR or provided MK-ID must match for the refund to be APPROVED.\n');
-        console.log('  Tip: set AUDIT_INTACT_THRESHOLD high (0.99) for an APPROVED demo,');
-        console.log('       or low (0.10) for a DENIED demo — no model retraining needed.\n');
+        console.log(`\n  Both transactions are linked to MK-ID:  ${MK_ID}  (${'Nestle Milo'})`);
+        console.log('  The chatbot extracts the MK-ID from your photo (or uses the one you type) and');
+        console.log('  matches it against the transaction. On a match it replies:');
+        console.log('      "Refund request done and pickup initiated."\n');
+        console.log('  Tip: if OCR can\'t read an MK-ID from the sample photo, just enter the MK-ID');
+        console.log(`       above in the chatbot's MK-ID field to complete the match.\n`);
     } catch (err) {
         console.error('❌ Seeding failed:', err.message);
         console.error('   • Did you run db/migration_otari.sql first?');

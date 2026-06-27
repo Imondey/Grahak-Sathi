@@ -157,6 +157,24 @@ class RefundVerifyRequest(BaseModel):
     product_name:   Optional[str] = None          # product name the customer states
 
 
+class RefundPickupRequest(BaseModel):
+    """MK-ID-anchored refund + pickup verification.
+
+    Flow (the requested behaviour):
+      1. The customer gives a transaction_id and a photo of the product.
+      2. We extract the MK-ID (manufacturer serial) from the photo — or use an
+         explicitly provided MK-ID / barcode.
+      3. We look up the MK-ID(s) linked to that transaction (what they bought).
+      4. If the extracted MK-ID is one of them -> refund request done & pickup
+         initiated; otherwise the refund can't be processed.
+    """
+    transaction_id: str                          # REQUIRED anchor
+    image_b64:      Optional[str] = None          # photo of the product being returned (MK-ID is OCR'd from it)
+    mk_id:          Optional[str] = None          # explicit MK-ID (if the customer typed/scanned it)
+    barcode:        Optional[str] = None          # explicit barcode (alternative identifier)
+    product_name:   Optional[str] = None          # product name the customer states (optional)
+
+
 # ── HELPER ─────────────────────────────────────────────────────────────────────
 def compute_fraud_risk(db_product: Optional[dict], yolo_label: str, ocr_text: str) -> float:
     """
@@ -493,6 +511,126 @@ async def verify_refund(req: RefundVerifyRequest):
         out["reason"] = "image_mismatch"
         out["message"] = (f"Refund not possible — the uploaded photo doesn't match the product purchased in "
                           f"transaction {req.transaction_id}" + (f" ({sold_name})" if sold_name else "") + ".")
+    return out
+
+
+# ── POST /audit/refund-pickup — MK-ID-anchored refund + pickup decision ───────
+@app.post("/audit/refund-pickup")
+async def refund_pickup(req: RefundPickupRequest):
+    """
+    The requested refund flow, anchored on the transaction's MK-ID(s):
+
+      1. Look up the MK-ID(s) linked to this transaction (the unit[s] the
+         customer actually purchased) from checkout_images.
+      2. Extract the MK-ID from the customer's uploaded photo (OCR) — or use an
+         explicitly provided MK-ID / barcode.
+      3. If the extracted MK-ID is one of the transaction's MK-ID(s):
+            -> "Refund request done and pickup initiated."
+         Otherwise the refund can't be processed.
+    """
+    out = {
+        "transaction_id": req.transaction_id,
+        "matched": False,
+        "refund_done": False,
+        "reason": None,
+        "message": None,
+    }
+
+    # 1. Which MK-IDs / barcodes are linked to this transaction?
+    txn_rows = []
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT mk_id, barcode FROM checkout_images WHERE transaction_id = $1 "
+                    "ORDER BY created_at DESC",
+                    req.transaction_id,
+                )
+            txn_rows = [dict(r) for r in rows]
+        except Exception as e:
+            print(f"[refund-pickup] transaction lookup failed: {e}")
+            out["reason"] = "lookup_error"
+            out["message"] = ("I couldn't access the transaction records right now. "
+                              "Please try again in a moment.")
+            return out
+
+    if not txn_rows:
+        out["reason"] = "transaction_not_found"
+        out["message"] = (f"No purchase was found for transaction {req.transaction_id}. "
+                          f"Please double-check the transaction ID on your receipt.")
+        return out
+
+    txn_mk_ids   = {(r["mk_id"] or "").upper() for r in txn_rows if r.get("mk_id")}
+    txn_barcodes = {r["barcode"] for r in txn_rows if r.get("barcode")}
+
+    # 2. Recognise the product the customer is returning.
+    #    Order: explicit MK-ID > explicit barcode > OCR the uploaded photo.
+    img = None
+    if req.image_b64 and not (req.mk_id or req.barcode):
+        try:
+            img = _decode_image(req.image_b64)
+        except Exception:
+            img = None
+    mk_id, barcode, method = recognize_mk_id(img, req.mk_id, req.barcode)
+    out["recognized_mk_id"]   = mk_id
+    out["recognized_barcode"] = barcode
+    out["recognition_method"] = method
+
+    if not mk_id and not barcode:
+        out["reason"] = "unrecognized"
+        out["message"] = ("I couldn't read a product MK-ID from your photo. Please upload a clearer, "
+                          "well-lit picture that shows the product's serial / MK-ID label, "
+                          "or enter the MK-ID directly.")
+        return out
+
+    # 3. Match the recognised identifier against what this transaction contains.
+    try:
+        from ai_core import MOCK_DB
+    except Exception:
+        MOCK_DB = {}
+
+    matched_barcode = None
+    if mk_id and mk_id.upper() in txn_mk_ids:
+        # MK-ID is explicitly linked to this transaction — strongest match.
+        for r in txn_rows:
+            if (r.get("mk_id") or "").upper() == mk_id.upper():
+                matched_barcode = r.get("barcode")
+                break
+        out["matched"] = True
+    elif barcode and barcode in txn_barcodes:
+        # No MK-ID match, but the barcode matches an item in the transaction.
+        matched_barcode = barcode
+        out["matched"] = True
+    elif mk_id and not txn_mk_ids and txn_barcodes:
+        # Legacy transactions stored before MK-IDs were captured: validate the
+        # OCR'd MK-ID against the manufacturer serials for the barcode(s) sold.
+        for bc in txn_barcodes:
+            product = MOCK_DB.get(bc)
+            if product and mk_id.upper() in [m.upper() for m in product.get("mk_ids", [])]:
+                matched_barcode = bc
+                out["matched"] = True
+                break
+
+    product      = MOCK_DB.get(matched_barcode) if matched_barcode else None
+    product_name = (product["product_name"] if product else None) or req.product_name
+    out["product_name"] = product_name
+    out["barcode"]      = matched_barcode
+
+    # 4. Decide.
+    identifier = mk_id or barcode
+    if out["matched"]:
+        out["refund_done"] = True
+        out["reason"] = "mkid_verified"
+        out["message"] = (
+            f"Refund request done and pickup initiated for "
+            f"{product_name or 'your item'} (MK-ID {identifier}) under transaction {req.transaction_id}."
+        )
+    else:
+        out["reason"] = "mkid_mismatch"
+        out["message"] = (
+            f"Refund not possible — the product in your photo (MK-ID {identifier}) doesn't match any item "
+            f"purchased under transaction {req.transaction_id}. Please check the transaction ID and item."
+        )
     return out
 
 

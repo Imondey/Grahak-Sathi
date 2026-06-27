@@ -25,13 +25,13 @@ const { Client } = require('pg');
 function usage(msg) {
     if (msg) console.error('Error:', msg);
     console.error('\nUsage:\n' +
-        '  node seed-images.js checkout <transaction_id> <image_path> [shop_id] [barcode] [channel]\n' +
+        '  node seed-images.js checkout <transaction_id> <image_path> [shop_id] [barcode] [channel] [mk_id]\n' +
         '  node seed-images.js delivery <transaction_id> <image_path> [shop_id] [barcode] [courier]\n');
     process.exit(1);
 }
 
 (async () => {
-    const [kind, transactionId, imagePath, shopId, barcode, last] = process.argv.slice(2);
+    const [kind, transactionId, imagePath, shopId, barcode, last, mkId] = process.argv.slice(2);
 
     if (!kind || !['checkout', 'delivery'].includes(kind)) usage('first arg must be "checkout" or "delivery".');
     if (!transactionId) usage('transaction_id is required.');
@@ -58,11 +58,11 @@ function usage(msg) {
             const days = parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
             await db.query(
                 `INSERT INTO checkout_images
-                   (transaction_id, shop_id, barcode, image_b64, purchase_channel, return_eligible_until, created_at)
-                 VALUES ($1,$2,$3,$4,$5, NOW() + ($6 || ' days')::interval, NOW())`,
-                [transactionId, shopId ? parseInt(shopId) : null, barcode || null, dataUrl, channel, String(days)]
+                   (transaction_id, shop_id, barcode, image_b64, mk_id, purchase_channel, return_eligible_until, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6, NOW() + ($7 || ' days')::interval, NOW())`,
+                [transactionId, shopId ? parseInt(shopId) : null, barcode || null, dataUrl, mkId || null, channel, String(days)]
             );
-            console.log(`✅ checkout_images: stored ${imagePath} for txn ${transactionId} (channel=${channel}, ${(b64.length/1024).toFixed(0)}KB)`);
+            console.log(`✅ checkout_images: stored ${imagePath} for txn ${transactionId} (channel=${channel}, mk_id=${mkId || 'n/a'}, ${(b64.length/1024).toFixed(0)}KB)`);
         } else {
             await db.query(
                 `INSERT INTO delivery_images
