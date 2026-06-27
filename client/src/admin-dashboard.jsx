@@ -12,6 +12,7 @@ export default function AdminDashboard({ user, setUser }) {
   const [logoutLoading, setLogoutLoading] = useState(false)
   const [toast, setToast]             = useState({ msg: '', type: '', show: false })
   const [copiedToken, setCopiedToken] = useState(null)
+  const [usage, setUsage]             = useState(null)
 
   useEffect(() => {
     const link = document.createElement('link')
@@ -19,9 +20,17 @@ export default function AdminDashboard({ user, setUser }) {
     link.href = 'https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&display=swap'
     if (!document.querySelector(`link[href="${link.href}"]`)) document.head.appendChild(link)
     fetchSessions()
-    const interval = setInterval(fetchSessions, 10000)
+    fetchUsage()
+    const interval = setInterval(() => { fetchSessions(); fetchUsage() }, 10000)
     return () => clearInterval(interval)
   }, [])
+
+  async function fetchUsage() {
+    try {
+      const res = await fetch('/api/admin/usage-transparency', { credentials: 'include' })
+      if (res.ok) setUsage(await res.json())
+    } catch {}
+  }
 
   function showToast(msg, type = 'success') {
     setToast({ msg, type, show: true })
@@ -170,6 +179,71 @@ export default function AdminDashboard({ user, setUser }) {
               </div>
             ))}
           </div>
+
+          {/* ── AI Cost & Usage Transparency (Otari) ── */}
+          {usage && (
+            <div style={{ background:'rgba(8,3,18,.88)', border:'1px solid rgba(109,40,217,.22)', borderRadius:18, padding:'22px 24px', marginBottom:20, animation:'cardIn .6s .15s cubic-bezier(.22,1,.36,1) both' }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8, fontFamily:'monospace', fontSize:10, fontWeight:600, letterSpacing:'2px', textTransform:'uppercase', color:'#4c1d95', marginBottom:16 }}>
+                AI Cost & Usage Transparency · Today <div style={{ flex:1, height:1, background:'rgba(109,40,217,.15)' }} />
+                <span style={{ color:'#a78bfa' }}>{usage.totalCalls || 0} calls</span>
+              </div>
+
+              {/* top metrics */}
+              <div style={{ display:'grid', gridTemplateColumns:'repeat(4, 1fr)', gap:12, marginBottom:18 }}>
+                {[
+                  { label:'AI Spend Today', value:`$${(usage.totalSpend||0).toFixed(3)}`, sub:`of $${(usage.budgetLimit||2).toFixed(2)}/session`, color:'#34d399' },
+                  { label:'Avg Latency', value: usage.avgLatencyMs != null ? `${usage.avgLatencyMs}ms` : '—', sub:'across tiers', color:'#a78bfa' },
+                  { label:'Injections Blocked', value: usage.injectionCount || 0, sub:`${(usage.injectionByStage||[]).map(s=>`S${s.stage}:${s.count}`).join(' ')||'none'}`, color:'#fb923c' },
+                  { label:'Return Claims', value:(usage.claims?.approved||0)+(usage.claims?.denied||0)+(usage.claims?.review||0), sub:`✅${usage.claims?.approved||0} ⛔${usage.claims?.denied||0} 🔎${usage.claims?.review||0}`, color:'#c4b5fd' },
+                ].map((m,i)=>(
+                  <div key={i} style={{ background:'rgba(0,0,0,.3)', border:'1px solid rgba(109,40,217,.15)', borderRadius:12, padding:'14px 16px' }}>
+                    <div style={{ fontSize:9, color:'#4c1d95', letterSpacing:'1.2px', textTransform:'uppercase', fontFamily:'monospace', marginBottom:6 }}>{m.label}</div>
+                    <div style={{ fontSize:22, fontWeight:800, color:m.color, lineHeight:1 }}>{m.value}</div>
+                    <div style={{ fontSize:9.5, color:'#64748b', marginTop:5, fontFamily:'monospace' }}>{m.sub}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* spend by tier */}
+              <div style={{ marginBottom:8 }}>
+                <div style={{ fontSize:10, color:'#64748b', fontFamily:'monospace', letterSpacing:'1px', marginBottom:10 }}>SPEND BY ROUTING TIER</div>
+                {['light','medium','high'].map(tier => {
+                  const row = (usage.spendByTier||[]).find(r => r.tier === tier) || { calls:0, spend:0, avg_latency:null }
+                  const tierColor = { light:'#34d399', medium:'#fbbf24', high:'#a78bfa' }[tier]
+                  const maxSpend = Math.max(0.0001, ...(usage.spendByTier||[]).map(r=>r.spend||0))
+                  const w = Math.min(100, ((row.spend||0)/maxSpend)*100)
+                  const meta = usage.tiers?.[tier]
+                  return (
+                    <div key={tier} style={{ display:'flex', alignItems:'center', gap:12, marginBottom:8 }}>
+                      <div style={{ width:140, flexShrink:0 }}>
+                        <span style={{ fontSize:11, fontWeight:700, color:tierColor, textTransform:'capitalize' }}>{tier}</span>
+                        <span style={{ fontSize:9, color:'#64748b', fontFamily:'monospace', marginLeft:6 }}>≤{meta?.latencyMs||'?'}ms</span>
+                      </div>
+                      <div style={{ flex:1, height:18, borderRadius:5, background:'rgba(124,58,237,.08)', overflow:'hidden', position:'relative' }}>
+                        <div style={{ height:'100%', width:`${w}%`, background:`${tierColor}55`, borderLeft:`2px solid ${tierColor}`, transition:'width .5s ease' }} />
+                      </div>
+                      <div style={{ width:150, flexShrink:0, textAlign:'right', fontFamily:'monospace', fontSize:10, color:'#94a3b8' }}>
+                        {row.calls||0} calls · ${(row.spend||0).toFixed(3)}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* recent injection attempts */}
+              {(usage.recentInjections||[]).length > 0 && (
+                <div style={{ marginTop:16, borderTop:'1px solid rgba(109,40,217,.12)', paddingTop:14 }}>
+                  <div style={{ fontSize:10, color:'#fb923c', fontFamily:'monospace', letterSpacing:'1px', marginBottom:8 }}>🛡️ RECENT INJECTION ATTEMPTS</div>
+                  {usage.recentInjections.slice(0,5).map((inj,i)=>(
+                    <div key={i} style={{ display:'flex', alignItems:'center', gap:10, padding:'5px 0', fontSize:11 }}>
+                      <span style={{ fontFamily:'monospace', fontSize:9, padding:'2px 7px', borderRadius:6, color:'#fb923c', background:'rgba(251,146,60,.1)', border:'1px solid rgba(251,146,60,.25)', flexShrink:0 }}>STAGE {inj.stage} · {inj.pattern}</span>
+                      <span style={{ color:'#64748b', fontFamily:'monospace', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{inj.snippet}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Create session */}
           <div style={{ background:'rgba(8,3,18,.88)', border:'1px solid rgba(109,40,217,.22)', borderRadius:18, padding:'22px 24px', marginBottom:20, animation:'cardIn .6s .2s cubic-bezier(.22,1,.36,1) both' }}>

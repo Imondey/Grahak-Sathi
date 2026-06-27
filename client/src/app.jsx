@@ -7,6 +7,7 @@ import HomePage          from './home.jsx'
 import AdminDashboard    from './admin-dashboard.jsx'
 import CheckoutPage      from './checkout.jsx'
 import TransactionPage   from './transaction.jsx'
+import ChatbotPage       from './chatbot.jsx'
 
 function LoadingScreen() {
   return (
@@ -75,6 +76,7 @@ export default function App() {
         <Route path="/"       element={<AdminLoginPage setUser={setUser} />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route path="/customer" element={<CustomerLoginPage setUser={setUser} />} />
+        <Route path="/returns" element={<ChatbotPage />} />
 
         {/* ── Protected: Admin logged in → all pages accessible ── */}
         <Route path="/home"        element={<AuthGuard user={user}><HomePage        user={user} setUser={setUser} /></AuthGuard>} />

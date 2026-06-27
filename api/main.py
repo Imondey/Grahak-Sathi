@@ -80,6 +80,14 @@ class MatchRequest(BaseModel):
     image_b64:     Optional[str] = None   # base64 image — triggers YOLO inference
 
 
+class AuditClaimRequest(BaseModel):
+    """High-tier visual verification of a post-purchase return claim."""
+    claim_type:         str                     # broken_label | damaged | wrong_size | wrong_item
+    checkout_image_b64: Optional[str] = None    # the live image saved at checkout
+    transaction_id:     Optional[str] = None
+    reference_label:    Optional[str] = None    # expected product (from inventory)
+
+
 # ── HELPER ─────────────────────────────────────────────────────────────────────
 def compute_fraud_risk(db_product: Optional[dict], yolo_label: str, ocr_text: str) -> float:
     """
@@ -141,6 +149,37 @@ def run_yolo(image_b64: str) -> list[str]:
     except Exception as e:
         print(f"YOLO inference error: {e}")
         return []
+
+
+def _decode_image(image_b64: str):
+    """Decode a base64 (optionally data-URL) image into an OpenCV BGR array."""
+    if "," in image_b64 and image_b64.strip().startswith("data:"):
+        image_b64 = image_b64.split(",", 1)[1]
+    img_bytes = base64.b64decode(image_b64)
+    img_array = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+
+def run_yolo_detailed(img) -> list[dict]:
+    """Run YOLO and return [{label, conf}, ...] sorted by confidence desc."""
+    if yolo_model is None or img is None:
+        return []
+    try:
+        results = yolo_model(img, verbose=False)
+        dets = [
+            {"label": yolo_model.names[int(b.cls)], "conf": float(b.conf)}
+            for r in results
+            for b in r.boxes
+        ]
+        return sorted(dets, key=lambda d: d["conf"], reverse=True)
+    except Exception as e:
+        print(f"YOLO detailed inference error: {e}")
+        return []
+
+
+# Threshold above which the product/label is considered cleanly "intact" in
+# the checkout image. Below it, a damage/broken-label claim is plausible.
+AUDIT_INTACT_THRESHOLD = float(os.getenv("AUDIT_INTACT_THRESHOLD", "0.55"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +378,117 @@ async def get_audit_log(shop_id: int, limit: int = 100):
             shop_id, limit
         )
     return {"logs": [dict(r) for r in rows]}
+
+
+# ── POST /audit/verify-claim — HIGH-TIER post-purchase visual verification ────
+@app.post("/audit/verify-claim")
+async def verify_claim(req: AuditClaimRequest):
+    """
+    The Conversational Auditor's High-tier vision step. Examines the live image
+    captured at checkout to decide whether the customer's return claim (e.g.
+    "the label was broken") is supported by the visual evidence at purchase time.
+
+    Returns:
+      claim_supported : True  → evidence supports the claim (refund possible)
+                        False → evidence contradicts the claim (item looked intact)
+                        None  → inconclusive → route to manual review
+      confidence      : 0.0–1.0 confidence in the verdict
+      finding         : human-readable explanation
+
+    NOTE: This uses the available YOLO detector as the visual reasoning model.
+    Detection confidence on the product/label is used as an "intactness" proxy —
+    a clean, high-confidence detection implies the label was intact at checkout,
+    so a "broken label" claim is contradicted. A production deployment would swap
+    in a fine-tuned label-integrity / damage-classification model behind this
+    same contract.
+    """
+    if not req.checkout_image_b64:
+        return {"claim_supported": None, "confidence": 0.0,
+                "finding": "No checkout image available to verify the claim."}
+
+    try:
+        img = _decode_image(req.checkout_image_b64)
+    except Exception as e:
+        return {"claim_supported": None, "confidence": 0.0,
+                "finding": f"Checkout image could not be decoded ({e})."}
+
+    if img is None:
+        return {"claim_supported": None, "confidence": 0.0,
+                "finding": "Checkout image could not be decoded."}
+
+    dets = run_yolo_detailed(img)
+    top_conf = dets[0]["conf"] if dets else 0.0
+    top_label = dets[0]["label"] if dets else None
+
+    # Sharpness as a secondary occlusion/damage cue (variance of Laplacian).
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        sharpness = 0.0
+
+    claim = (req.claim_type or "damaged").lower()
+
+    if yolo_model is None or not dets:
+        # Without a working detector we cannot assert intact-ness either way.
+        return {
+            "claim_supported": None,
+            "confidence": 0.2,
+            "finding": "Visual model could not confidently locate the product/label "
+                       "in the checkout image — manual review recommended.",
+            "top_label": top_label,
+            "detections": dets[:5],
+        }
+
+    if claim in ("broken_label", "damaged"):
+        intact = top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0
+        if intact:
+            # Product/label cleanly visible at checkout → claim contradicted.
+            return {
+                "claim_supported": False,
+                "confidence": round(min(0.99, top_conf), 2),
+                "finding": f"At checkout the product/label was clearly visible "
+                           f"({top_label}, {round(top_conf*100)}% detection) — it appears intact, "
+                           f"contradicting the '{claim}' claim.",
+                "top_label": top_label,
+                "detections": dets[:5],
+            }
+        else:
+            # Low-confidence/occluded detection → damage claim is plausible.
+            return {
+                "claim_supported": True,
+                "confidence": round(min(0.95, 1.0 - top_conf + 0.2), 2),
+                "finding": f"The product/label was poorly resolved at checkout "
+                           f"(detection {round(top_conf*100)}%, sharpness {round(sharpness)}), "
+                           f"consistent with a '{claim}' condition.",
+                "top_label": top_label,
+                "detections": dets[:5],
+            }
+
+    if claim in ("wrong_item", "wrong_size"):
+        if req.reference_label and top_label:
+            score = fuzz.token_set_ratio(req.reference_label.lower(), top_label.lower()) / 100
+            supported = score < 0.5   # detected item differs from expected → claim supported
+            return {
+                "claim_supported": bool(supported),
+                "confidence": round(abs(0.5 - score) * 2, 2),
+                "finding": f"Checkout image shows '{top_label}' vs expected "
+                           f"'{req.reference_label}' (match {round(score*100)}%).",
+                "top_label": top_label,
+                "detections": dets[:5],
+            }
+        return {
+            "claim_supported": None,
+            "confidence": 0.3,
+            "finding": "Size/item claims need the original reference product to compare — "
+                       "routed to manual review.",
+            "top_label": top_label,
+            "detections": dets[:5],
+        }
+
+    return {"claim_supported": None, "confidence": 0.2,
+            "finding": f"Unsupported claim type '{claim}' — manual review.",
+            "top_label": top_label, "detections": dets[:5]}
 
 
 # ── Internal audit helper ──────────────────────────────────────────────────────
