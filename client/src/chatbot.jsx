@@ -56,6 +56,7 @@ export default function ChatbotPage({ user }) {
   }])
   const [input, setInput]   = useState('')
   const [txnId, setTxnId]   = useState('')
+  const [custId, setCustId] = useState('')
   const [sending, setSending] = useState(false)
   const [budget, setBudget] = useState(null)
   const [imageB64, setImageB64] = useState(null)
@@ -110,6 +111,7 @@ export default function ChatbotPage({ user }) {
         body: JSON.stringify({
           message: text,
           transaction_id: txnId.trim() || null,
+          user_id: custId.trim() || null,
           budget_session: budgetSession.current,
           image_b64: attached || null,
         }),
@@ -266,6 +268,14 @@ export default function ChatbotPage({ user }) {
               {/* Channel + per-image seal/intactness findings (refund verification) */}
               {m.role === 'bot' && m.verification && m.verification.channel && (
                 <div style={{ marginTop:6, display:'flex', flexWrap:'wrap', gap:5, alignItems:'center' }}>
+                  {m.verification.purchase && (
+                    <span style={{ fontSize:9, fontWeight:700, padding:'2px 8px', borderRadius:20,
+                      color: m.verification.purchase.status==='APPROVED' ? '#34d399' : m.verification.purchase.status==='REJECTED' ? '#f87171' : '#fbbf24',
+                      border:`1px solid ${m.verification.purchase.status==='APPROVED' ? '#34d39955' : m.verification.purchase.status==='REJECTED' ? '#f8717155' : '#fbbf2455'}`,
+                      background: m.verification.purchase.status==='APPROVED' ? '#34d39914' : m.verification.purchase.status==='REJECTED' ? '#f8717114' : '#fbbf2414' }}>
+                      {m.verification.purchase.status==='APPROVED' ? '✅ Purchase verified' : m.verification.purchase.status==='REJECTED' ? '⛔ Not in purchase history' : '🔎 Purchase review'}
+                    </span>
+                  )}
                   <span style={{ fontSize:9, fontWeight:700, padding:'2px 8px', borderRadius:20, color:'#22d3ee', border:'1px solid #22d3ee55', background:'#22d3ee14' }}>
                     {m.verification.channel === 'online' ? '🚚 Online order' : '🏪 In-store purchase'}
                   </span>
@@ -315,6 +325,10 @@ export default function ChatbotPage({ user }) {
             <input value={txnId} onChange={e => setTxnId(e.target.value)} placeholder="Transaction ID (optional, for claim verification)"
               style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:10, color:'#e9d5ff', fontFamily:'monospace', fontSize:11.5, padding:'9px 13px', outline:'none' }} />
             <button onClick={resetBudget} title="Start a fresh session budget" style={{ padding:'9px 14px', borderRadius:10, fontSize:11, border:'1px solid rgba(109,40,217,.3)', background:'transparent', color:'#6d28d9', cursor:'pointer', whiteSpace:'nowrap' }}>↺ New session</button>
+          </div>
+          <div style={{ display:'flex', gap:8, marginBottom:8 }}>
+            <input value={custId} onChange={e => setCustId(e.target.value)} placeholder="Customer ID (optional, e.g. USER_9921 — verifies the item is in your purchase history)"
+              style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:10, color:'#e9d5ff', fontFamily:'monospace', fontSize:11.5, padding:'9px 13px', outline:'none' }} />
           </div>
           {imageB64 && (
             <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:8, padding:'6px 10px', borderRadius:10, background:'rgba(109,40,217,.07)', border:'1px solid rgba(109,40,217,.25)' }}>

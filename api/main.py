@@ -21,6 +21,7 @@ import redis.asyncio as aioredis
 from datetime import datetime
 
 import injection_model   # local self-hosted LSTM prompt-injection classifier
+import purchase_verifier # anti-fraud: cross-check complaint product vs purchase history
 
 load_dotenv()
 
@@ -38,14 +39,20 @@ app.add_middleware(
 DB_URL     = os.getenv("DATABASE_URL", "postgresql://postgres:1221@localhost:5432/Netra")
 REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379")
 MODEL_PATH = os.getenv("MODEL_PATH", "./AI_Model/best_final.pt")
+# General-purpose COCO detector (80 common classes). Used as a FALLBACK so that
+# customer-uploaded refund photos — which the narrow retail model (product/barcode)
+# usually can't recognise — still produce a detection instead of always going to
+# manual review.
+GENERAL_MODEL_PATH = os.getenv("GENERAL_MODEL_PATH", "./AI_Model/yolov8n.pt")
 
 db_pool    = None
 redis_pool = None
 yolo_model = None   # loaded lazily in startup — never at module level
+general_model = None  # general COCO fallback detector
 
 @app.on_event("startup")
 async def startup():
-    global db_pool, redis_pool, yolo_model
+    global db_pool, redis_pool, yolo_model, general_model
 
     db_pool    = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
     redis_pool = await aioredis.from_url(REDIS_URL, decode_responses=True)
@@ -59,6 +66,13 @@ async def startup():
             print(f"✅ YOLOv8 model loaded from {MODEL_PATH}")
         else:
             print(f"⚠️  YOLO model not found at {MODEL_PATH} — running without visual verification")
+
+        # General COCO fallback detector (so arbitrary refund photos are still detected).
+        if os.path.exists(GENERAL_MODEL_PATH):
+            general_model = YOLO(GENERAL_MODEL_PATH)
+            print(f"✅ General fallback detector loaded from {GENERAL_MODEL_PATH}")
+        else:
+            print(f"ℹ️  General fallback detector not found at {GENERAL_MODEL_PATH} — refund photos rely on the retail model only")
     except Exception as e:
         print(f"⚠️  YOLO load failed ({e}) — running without visual verification")
 
@@ -119,6 +133,15 @@ class AuditClaimRequest(BaseModel):
 class InjectionCheckRequest(BaseModel):
     """Stage-2 prompt-injection classification request."""
     text: str
+
+
+class PurchaseVerifyRequest(BaseModel):
+    """Anti-fraud: verify the complained product is in the user's purchase history."""
+    user_id:        str                          # customer identifier
+    mk_id:          Optional[str] = None         # explicit MK-ID (if scanned/typed)
+    barcode:        Optional[str] = None         # explicit barcode (alternative key)
+    image_b64:      Optional[str] = None         # complaint photo — OCR'd for the MK-ID/barcode
+    complaint_text: Optional[str] = None
 
 
 # ── HELPER ─────────────────────────────────────────────────────────────────────
@@ -194,25 +217,74 @@ def _decode_image(image_b64: str):
 
 
 def run_yolo_detailed(img) -> list[dict]:
-    """Run YOLO and return [{label, conf}, ...] sorted by confidence desc."""
-    if yolo_model is None or img is None:
+    """Run the retail detector; if it finds nothing, fall back to the general
+    COCO detector so arbitrary customer/refund photos still yield a detection.
+    Returns [{label, conf, model}, ...] sorted by confidence desc."""
+    if img is None:
         return []
-    try:
-        results = yolo_model(img, verbose=False)
-        dets = [
-            {"label": yolo_model.names[int(b.cls)], "conf": float(b.conf)}
-            for r in results
-            for b in r.boxes
-        ]
-        return sorted(dets, key=lambda d: d["conf"], reverse=True)
-    except Exception as e:
-        print(f"YOLO detailed inference error: {e}")
-        return []
+
+    def _run(model, tag):
+        if model is None:
+            return []
+        try:
+            results = model(img, verbose=False)
+            return [
+                {"label": model.names[int(b.cls)], "conf": float(b.conf), "model": tag}
+                for r in results for b in r.boxes
+            ]
+        except Exception as e:
+            print(f"YOLO detailed inference error ({tag}): {e}")
+            return []
+
+    dets = _run(yolo_model, "retail")
+    if not dets:                       # narrow model saw nothing → try the general one
+        dets = _run(general_model, "general")
+    return sorted(dets, key=lambda d: d["conf"], reverse=True)
 
 
 # Threshold above which the product/label is considered cleanly "intact" in
 # the checkout image. Below it, a damage/broken-label claim is plausible.
 AUDIT_INTACT_THRESHOLD = float(os.getenv("AUDIT_INTACT_THRESHOLD", "0.55"))
+
+
+# Lazy EasyOCR reader (heavy) — only initialised the first time we OCR a photo.
+_ocr_reader = None
+
+
+def _ocr_texts(img) -> list[str]:
+    """Read text fragments from an image (used to recover the MK-ID/barcode).
+    Fails soft to [] if EasyOCR isn't installed or inference errors."""
+    global _ocr_reader
+    if img is None:
+        return []
+    try:
+        if _ocr_reader is None:
+            import easyocr
+            _ocr_reader = easyocr.Reader(["en"], gpu=False)
+        return [t for (_b, t, c) in _ocr_reader.readtext(img) if c and c > 0.3]
+    except Exception as e:
+        print(f"[recognize] OCR unavailable ({e})")
+        return []
+
+
+def recognize_mk_id(img, provided_mk_id=None, provided_barcode=None):
+    """
+    Recognise the product identity for a complaint photo.
+    Order: explicit MK-ID > explicit barcode > OCR the photo for an MK-ID/barcode.
+    Returns (mk_id, barcode, method).
+    """
+    if provided_mk_id:
+        return provided_mk_id.strip().upper(), (provided_barcode or None), "provided_mk_id"
+    if provided_barcode:
+        return None, provided_barcode.strip(), "provided_barcode"
+    texts = _ocr_texts(img)
+    mk = purchase_verifier.extract_mk_id_from_texts(texts)
+    if mk:
+        return mk, None, "ocr_mk_id"
+    bc = purchase_verifier.extract_barcode_from_texts(texts)
+    if bc:
+        return None, bc, "ocr_barcode"
+    return None, None, "unrecognized"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,6 +307,7 @@ async def health():
             "db": "connected",
             "redis": "connected",
             "yolo": yolo_status,
+            "general_detector": "loaded" if general_model is not None else "not_loaded",
             "injection_lstm": "ready" if injection_model.is_ready() else "disabled",
         }
     except Exception as e:
@@ -257,6 +330,28 @@ async def injection_check(req: InjectionCheckRequest):
         return {"available": injection_model.is_ready(), "injection": False,
                 "score": 0.0, "confidence": 0.0, "label": "safe"}
     return injection_model.predict(text)
+
+
+# ── POST /audit/verify-purchase — anti-fraud purchase-history check ───────────
+@app.post("/audit/verify-purchase")
+async def verify_purchase(req: PurchaseVerifyRequest):
+    """
+    Recognise the product in the complaint photo (or use a provided MK-ID/barcode)
+    and verify it exists in the user's purchase history. Mirrors the reference
+    flow: recognise -> look up user -> cross-reference -> APPROVED / REJECTED.
+    """
+    img = None
+    if req.image_b64 and not (req.mk_id or req.barcode):
+        try:
+            img = _decode_image(req.image_b64)
+        except Exception:
+            img = None
+    mk_id, barcode, method = recognize_mk_id(img, req.mk_id, req.barcode)
+    result = await purchase_verifier.verify_complaint(db_pool, req.user_id, mk_id, barcode)
+    result["recognized_mk_id"] = mk_id
+    result["recognized_barcode"] = barcode
+    result["recognition_method"] = method
+    return result
 
 
 # ── POST /verify — called by Node.js checkout gateway ─────────────────────────
@@ -455,8 +550,11 @@ def _analyze_intactness(img) -> dict:
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     except Exception:
         sharpness = 0.0
-    model_available = yolo_model is not None and bool(dets)
-    intact = bool(model_available and top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0)
+    model_available = bool(dets)   # a detection from EITHER the retail or general model
+    # intact is True/False only when the model actually located a product; when it
+    # couldn't (model not loaded or nothing detected) it's None → "inconclusive",
+    # NOT "damaged" (avoids mislabeling an unreadable photo as damaged).
+    intact = (top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0) if model_available else None
     return {
         "top_label":       top_label,
         "top_conf":        round(top_conf, 3),

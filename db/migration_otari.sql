@@ -92,3 +92,21 @@ CREATE INDEX IF NOT EXISTS idx_delivery_images_txn ON delivery_images (transacti
 -- a receipt to the checkout_images / delivery_images used for refund verification.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_transactions_txn_id ON transactions (transaction_id);
+
+
+-- ── Customer purchase history (anti-fraud refund verification) ────────────────
+-- Maps a customer (user_id) to the specific MK-IDs / products they bought, so a
+-- refund complaint can be cross-checked: the product recognised in the uploaded
+-- photo must exist in THIS user's purchase history, otherwise it's rejected.
+CREATE TABLE IF NOT EXISTS customer_purchases (
+    id             BIGSERIAL PRIMARY KEY,
+    user_id        TEXT        NOT NULL,        -- customer identifier (login id / phone / session)
+    customer_name  TEXT,
+    order_id       TEXT,
+    mk_id          TEXT        NOT NULL,        -- manufacturer serial of the purchased unit
+    barcode        TEXT,
+    product_name   TEXT,
+    purchased_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_customer_purchases_user ON customer_purchases (user_id);
+CREATE INDEX IF NOT EXISTS idx_customer_purchases_mkid ON customer_purchases (mk_id);
