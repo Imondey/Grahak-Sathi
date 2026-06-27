@@ -85,3 +85,10 @@ CREATE TABLE IF NOT EXISTS delivery_images (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_delivery_images_txn ON delivery_images (transaction_id);
+
+
+-- ── Refund transaction ID on the base transactions table ──────────────────────
+-- The random numeric transaction ID issued to the customer at payment. It links
+-- a receipt to the checkout_images / delivery_images used for refund verification.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transaction_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_transactions_txn_id ON transactions (transaction_id);

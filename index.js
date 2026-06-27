@@ -41,6 +41,7 @@ const knowledgeBase           = require('./lib/knowledgeBase');
 const { createBudgetEngine }  = require('./lib/budgetEngine');
 const { createAuditor }       = require('./lib/auditor');
 const { createCustomerAssistant } = require('./lib/customerAssistant');
+const { generateTransactionId } = require('./lib/txnId');
 
 const app         = express();
 const PORT        = process.env.PORT || 3000;
@@ -163,6 +164,43 @@ async function getDeliveryImage(transactionId) {
         if (!getDeliveryImage._warned) { console.warn('delivery_images read skipped:', err.message); getDeliveryImage._warned = true; }
     }
     return null;
+}
+
+// Generate a random numeric transaction ID, retrying on the (extremely unlikely)
+// chance it already exists in checkout_images. Falls back to the raw random id
+// if the DB can't be reached, so a purchase is never blocked by ID generation.
+async function generateUniqueTransactionId(attempts = 5) {
+    for (let i = 0; i < attempts; i++) {
+        const id = generateTransactionId(12);
+        try {
+            const r = await db.query(
+                `SELECT 1 FROM checkout_images WHERE transaction_id = $1 LIMIT 1`, [id]
+            );
+            if (r.rows.length === 0) return id;
+        } catch (err) {
+            // checkout_images may not exist yet (pre-migration) — accept the id.
+            return id;
+        }
+    }
+    return generateTransactionId(14);   // widen the space and accept
+}
+
+// Persist a delivery photo (Delivery DB) for an ONLINE order, keyed by the
+// transaction ID, so a refund claim can compare it against the dispatch image.
+async function saveDeliveryImage({ transactionId, shopId, barcode, imageB64, courier = null }) {
+    if (!transactionId || !imageB64) return false;
+    try {
+        await db.query(
+            `INSERT INTO delivery_images
+               (transaction_id, shop_id, barcode, image_b64, courier, delivered_at, created_at)
+             VALUES ($1,$2,$3,$4,$5, NOW(), NOW())`,
+            [transactionId, shopId, barcode || null, imageB64, courier]
+        );
+        return true;
+    } catch (err) {
+        if (!saveDeliveryImage._warned) { console.warn('delivery_images insert skipped (run migration_otari.sql):', err.message); saveDeliveryImage._warned = true; }
+        return false;
+    }
 }
 
 // Stage-2 prompt-injection classifier — calls the self-hosted LSTM on FastAPI.
@@ -319,8 +357,10 @@ const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 app.use('/uploads', express.static('uploads'));
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Raised limit: base64 product/delivery images (for refund verification) are
+// sent as JSON and a full-res webcam JPEG can exceed the 100kb Express default.
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '12mb' }));
+app.use(express.urlencoded({ extended: true, limit: process.env.JSON_BODY_LIMIT || '12mb' }));
 
 // ── Redis-backed Session Store ────────────────────────────────────────────────
 app.use(session({
@@ -1053,12 +1093,20 @@ async function dedupLowStockNotifications(shopId, lowStockItems) {
 app.post('/api/checkout/pay', isAuth, async (req, res) => {
     const shop  = req.session.user;
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    // Purchase channel for the receipt/refund record: 'offline' (in-store) | 'online'.
+    const channel = (String(req.body?.channel || 'offline').toLowerCase() === 'online') ? 'online' : 'offline';
 
     if (items.length === 0)
         return res.status(400).json({ ok: false, message: 'Cart is empty.' });
 
     const cleanItems = items
-        .map(i => ({ barcode: String(i.barcode || '').trim(), qty: Math.max(1, parseInt(i.qty) || 1) }))
+        .map(i => ({
+            barcode:  String(i.barcode || '').trim(),
+            qty:      Math.max(1, parseInt(i.qty) || 1),
+            // Optional product image captured at checkout (data-URL or base64).
+            image_b64: typeof i.image_b64 === 'string' ? i.image_b64
+                     : typeof i.productThumb === 'string' ? i.productThumb : null,
+        }))
         .filter(i => i.barcode.length >= 4);
 
     if (cleanItems.length === 0)
@@ -1119,6 +1167,24 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         return res.status(500).json({ ok: false, message: 'Sale failed. Please retry.' });
     }
 
+    // ── Issue the refund transaction ID (random number) for this receipt ──────
+    // One ID per receipt. The product image captured at checkout is saved under
+    // this ID (Customer DB) so a later refund claim can be verified against it.
+    const transactionId   = await generateUniqueTransactionId();
+    const returnWindowDays = parseInt(process.env.RETURN_WINDOW_DAYS) || 30;
+    let imagesSaved = 0;
+    for (const it of cleanItems) {
+        if (it.image_b64) {
+            const ok = await saveCheckoutImage({
+                transactionId, shopId: shop.id, barcode: it.barcode,
+                imageB64: it.image_b64, channel, returnWindowDays,
+            });
+            if (ok) imagesSaved++;
+        }
+    }
+    const returnEligibleUntil = new Date(Date.now() + returnWindowDays * 86400000).toISOString();
+    console.log(`🧾 Transaction ${transactionId} issued (channel=${channel}, ${imagesSaved} checkout image(s) stored).`);
+
     // Dedup against Redis: if we've already emailed about this barcode within
     // the last 24h, skip it. Prevents one slow-moving SKU from spamming the
     // retailer every time it's sold.
@@ -1162,7 +1228,15 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         }, 5000);
     }
 
-    return res.status(200).json({ ok: true, lowStock, sessionAutoEnd: shop.role === 'customer' ? 5 : null });
+    return res.status(200).json({
+        ok: true,
+        lowStock,
+        transaction_id: transactionId,
+        returnEligibleUntil,
+        checkoutImagesStored: imagesSaved,
+        channel,
+        sessionAutoEnd: shop.role === 'customer' ? 5 : null,
+    });
 });
 
 // ── ALERTS ────────────────────────────────────────────────────────────────────
@@ -1351,6 +1425,33 @@ app.post('/api/chatbot/reset-budget', async (req, res) => {
     const sessionId = budgetSessionId(req);
     const snap = await budgetEngine.reset(sessionId);
     res.json({ ...snap, reset: true });
+});
+
+// ── Refund image ingestion (Customer DB + Delivery DB) ───────────────────────
+// Attach/replace the PRODUCT image for a transaction (Customer DB). Use this to
+// backfill a receipt that paid without a captured image, or to correct one.
+app.post('/api/checkout/upload-image', isAuth, async (req, res) => {
+    const { transaction_id, image_b64, barcode, channel } = req.body || {};
+    if (!transaction_id || !image_b64)
+        return res.status(400).json({ ok: false, message: 'transaction_id and image_b64 are required.' });
+    const ch = String(channel || 'offline').toLowerCase() === 'online' ? 'online' : 'offline';
+    const ok = await saveCheckoutImage({
+        transactionId: String(transaction_id).trim(), shopId: req.session.user.id,
+        barcode, imageB64: image_b64, channel: ch,
+    });
+    return res.status(ok ? 200 : 500).json({ ok, transaction_id: String(transaction_id).trim(), channel: ch });
+});
+
+// Attach a DELIVERY photo for an online order (Delivery DB).
+app.post('/api/delivery/upload-image', isAuth, async (req, res) => {
+    const { transaction_id, image_b64, barcode, courier } = req.body || {};
+    if (!transaction_id || !image_b64)
+        return res.status(400).json({ ok: false, message: 'transaction_id and image_b64 are required.' });
+    const ok = await saveDeliveryImage({
+        transactionId: String(transaction_id).trim(), shopId: req.session.user.id,
+        barcode, imageB64: image_b64, courier: courier || null,
+    });
+    return res.status(ok ? 200 : 500).json({ ok, transaction_id: String(transaction_id).trim() });
 });
 
 // GET /api/admin/usage-transparency — manager dashboard metrics (admin only).

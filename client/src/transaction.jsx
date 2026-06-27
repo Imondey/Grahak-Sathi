@@ -508,6 +508,7 @@ export default function TransactionPage({ user, setUser }) {
   const [scannerOpen, setScannerOpen] = useState(false)
   const [toast, setToast]         = useState({ msg:'', type:'', show:false })
   const [paid, setPaid]           = useState(false)
+  const [receiptId, setReceiptId] = useState(null)
   const [fraudCount, setFraudCount] = useState(0)
 
   useEffect(() => {
@@ -617,9 +618,10 @@ export default function TransactionPage({ user, setUser }) {
     setScanning(true)
     try {
       const payload = {
+        channel: 'offline',
         items: verifiedItems
           .filter(c => c.barcode)
-          .map(c => ({ barcode: c.barcode, qty: c.qty })),
+          .map(c => ({ barcode: c.barcode, qty: c.qty, image_b64: c.productThumb || null })),
       }
       const res = await fetch('/api/checkout/pay', {
         method: 'POST',
@@ -643,6 +645,7 @@ export default function TransactionPage({ user, setUser }) {
       } else {
         showToast('Transaction complete — receipt generated', 'success')
       }
+      if (data.transaction_id) setReceiptId(data.transaction_id)
       setScanning(false)
       setPaid(true)
 
@@ -675,6 +678,19 @@ export default function TransactionPage({ user, setUser }) {
         <div style={{ fontSize:64,animation:'popIn .5s cubic-bezier(.34,1.56,.64,1) both' }}>✅</div>
         <div style={{ fontFamily:"'Sora',sans-serif",fontSize:28,fontWeight:800,color:'#86efac',animation:'popIn .5s .1s cubic-bezier(.34,1.56,.64,1) both' }}>Payment Complete</div>
         <div style={{ fontSize:13,color:'#4c1d95',animation:'popIn .5s .2s cubic-bezier(.34,1.56,.64,1) both' }}>₹{total.toFixed(2)} · {verifiedItems.length} item{verifiedItems.length!==1?'s':''}</div>
+        {receiptId && (
+          <div style={{ animation:'popIn .5s .22s cubic-bezier(.34,1.56,.64,1) both', textAlign:'center', marginTop:6 }}>
+            <div style={{ fontSize:10, color:'#4c1d95', fontFamily:'monospace', letterSpacing:'1.5px', textTransform:'uppercase', marginBottom:6 }}>Transaction ID — keep for refunds</div>
+            <div style={{ display:'inline-flex', alignItems:'center', gap:10, padding:'10px 18px', borderRadius:12, background:'rgba(124,58,237,.1)', border:'1px solid rgba(124,58,237,.35)' }}>
+              <span style={{ fontFamily:'monospace', fontSize:20, fontWeight:800, letterSpacing:'2px', color:'#e9d5ff' }}>{receiptId}</span>
+              <button
+                onClick={() => { try { navigator.clipboard.writeText(receiptId); showToast('Transaction ID copied', 'success') } catch {} }}
+                title="Copy transaction ID"
+                style={{ padding:'6px 12px', borderRadius:8, border:'1px solid rgba(109,40,217,.35)', background:'transparent', color:'#a78bfa', cursor:'pointer', fontSize:12 }}
+              >📋 Copy</button>
+            </div>
+          </div>
+        )}
         <div style={{ fontSize:11,color:'#a78bfa',fontFamily:'monospace',animation:'popIn .5s .25s cubic-bezier(.34,1.56,.64,1) both',letterSpacing:'.8px' }}>
           Session will auto-end in 5 seconds…
         </div>
