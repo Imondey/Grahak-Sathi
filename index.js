@@ -37,8 +37,10 @@ const { RedisStore } = require('connect-redis');
 const aiConfig                = require('./lib/aiConfig');
 const modelRouter             = require('./lib/modelRouter');
 const injectionFilter         = require('./lib/injectionFilter');
+const knowledgeBase           = require('./lib/knowledgeBase');
 const { createBudgetEngine }  = require('./lib/budgetEngine');
 const { createAuditor }       = require('./lib/auditor');
+const { createCustomerAssistant } = require('./lib/customerAssistant');
 
 const app         = express();
 const PORT        = process.env.PORT || 3000;
@@ -48,16 +50,18 @@ const SALT_ROUNDS = 10;
 // ── SendGrid Setup ────────────────────────────────────────────────────────────
 sgMail.setApiKey(process.env.SENDGRID_API_KEY || '');
 
-// ── Groq / Llama AI Setup ─────────────────────────────────────────────────────
-const Groq = require('groq-sdk');
-const groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY || '' });
+// ── Otari LLM Gateway Setup (Mozilla.ai) ──────────────────────────────────────
+// Replaces the Groq SDK. All LLM traffic routes through the Otari gateway
+// (OpenAI-compatible), which manages provider keys, routing, budgets & usage.
+const { createOtariClient } = require('./lib/otariClient');
+const otari = createOtariClient();
 
 /**
- * Generate a human-readable fraud alert explanation using Llama via Groq.
+ * Generate a human-readable fraud alert explanation via the Otari gateway.
  * Returns a plain-English summary the admin can quickly understand.
  */
 async function generateFraudExplanation({ barcode, product_name, risk_score, action, intelligence_flags, shop_name }) {
-    if (!process.env.GROQ_API_KEY) return null; // Skip if no API key configured
+    if (!otari.enabled) return null; // Skip if the Otari gateway isn't configured
     try {
         const prompt = `You are a retail fraud analyst AI. Write a brief, clear explanation (3-5 sentences) for a store admin about a fraud alert.
 
@@ -71,16 +75,13 @@ Details:
 
 Write in simple language. Explain WHAT happened, WHY it's suspicious, and WHAT the admin should do next. Be concise and actionable.`;
 
-        const chatCompletion = await groqClient.chat.completions.create({
-            messages: [{ role: 'user', content: prompt }],
-            model: 'llama-3.1-8b-instant',
-            temperature: 0.3,
-            max_tokens: 250,
-        });
-
-        return chatCompletion.choices[0]?.message?.content?.trim() || null;
+        const r = await otari.chat(
+            [{ role: 'user', content: prompt }],
+            { temperature: 0.3, maxTokens: 250 }
+        );
+        return r ? r.content : null;
     } catch (err) {
-        console.warn('Groq/Llama fraud explanation error (non-fatal):', err.message);
+        console.warn('Otari fraud explanation error (non-fatal):', err.message);
         return null;
     }
 }
@@ -94,7 +95,7 @@ redisClient.connect()
     .catch(err => { console.error('❌ Redis connection failed:', err.message); });
 
 // ── Cost-Aware AI: budget engine + conversational auditor ──────────────────────
-const HAS_GROQ_KEY = !!process.env.GROQ_API_KEY;
+const LLM_ENABLED  = otari.enabled;   // Otari gateway configured?
 const budgetEngine = createBudgetEngine(redisClient);
 
 // Persist a model-usage record for the transparency dashboard (fire-and-forget).
@@ -140,16 +141,81 @@ async function getCheckoutImage(transactionId) {
 }
 
 const auditor = createAuditor({
-    groqClient,
+    llm:        otari,
     axios,
     fastapiUrl: FASTAPI_URL,
     budget:     budgetEngine,
     router:     modelRouter,
     injection:  injectionFilter,
-    hasGroqKey: HAS_GROQ_KEY,
     logUsage,
     logInjection,
     getCheckoutImage,
+});
+
+// ── Grounded retrieval helpers for the general customer assistant ──────────────
+// Live product lookup from the real inventory (proves the bot isn't just an LLM).
+async function lookupProduct(shopId, terms) {
+    if (shopId == null || !Array.isArray(terms) || terms.length === 0) return [];
+    const patterns = terms.map(t => `%${t}%`);
+    try {
+        const r = await db.query(
+            `SELECT product_name, price, quantity, barcode
+               FROM products
+              WHERE shop_id = $1 AND product_name ILIKE ANY($2::text[])
+              ORDER BY product_name
+              LIMIT 5`,
+            [shopId, patterns]
+        );
+        return r.rows;
+    } catch (err) {
+        if (!lookupProduct._warned) { console.warn('product lookup skipped:', err.message); lookupProduct._warned = true; }
+        return [];
+    }
+}
+
+// Order / claim status lookup from the DB (return_claims first, then transactions).
+async function lookupOrder(shopId, transactionId) {
+    const txn = String(transactionId || '').trim();
+    if (!txn) return null;
+    try {
+        const c = await db.query(
+            `SELECT decision, intent, claim_type, created_at
+               FROM return_claims
+              WHERE transaction_id = $1
+              ORDER BY created_at DESC LIMIT 1`,
+            [txn]
+        );
+        if (c.rows.length > 0) return { type: 'claim', ...c.rows[0] };
+    } catch (err) {
+        if (!lookupOrder._warnedC) { console.warn('claim lookup skipped:', err.message); lookupOrder._warnedC = true; }
+    }
+    // Fallback: treat the value as a barcode against this shop's transactions.
+    try {
+        const t = await db.query(
+            `SELECT product_name, status, scanned_at
+               FROM transactions
+              WHERE shop_id = $1 AND barcode = $2
+              ORDER BY scanned_at DESC LIMIT 1`,
+            [shopId, txn]
+        );
+        if (t.rows.length > 0) return { type: 'transaction', ...t.rows[0] };
+    } catch (err) {
+        if (!lookupOrder._warnedT) { console.warn('transaction lookup skipped:', err.message); lookupOrder._warnedT = true; }
+    }
+    return null;
+}
+
+const assistant = createCustomerAssistant({
+    kb:         knowledgeBase,
+    injection:  injectionFilter,
+    router:     modelRouter,
+    budget:     budgetEngine,
+    auditor,
+    llm:        otari,
+    lookupProduct,
+    lookupOrder,
+    logUsage,
+    logInjection,
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1167,6 +1233,50 @@ app.post('/api/chatbot/audit', async (req, res) => {
     }
 });
 
+// POST /api/chatbot/ask — General-purpose hybrid Customer Assistant (public).
+// NOT a pure LLM wrapper: rule-based intent + knowledge base + live DB lookups,
+// delegating refund claims to the visual auditor and using the LLM only as a
+// grounded, budget-gated fallback (with human handoff when out of scope).
+app.post('/api/chatbot/ask', async (req, res) => {
+    const { message, transaction_id, image_b64 } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim())
+        return res.status(400).json({ message: 'A message is required.' });
+    if (message.length > 4000)
+        return res.status(413).json({ message: 'Message too long.' });
+
+    const sessionId = budgetSessionId(req);
+    const shopId    = req.session?.user?.id || null;
+
+    try {
+        const result = await assistant.handle({
+            sessionId,
+            shopId,
+            message: message.trim(),
+            transactionId: transaction_id ?? null,
+            imageB64: image_b64 || null,
+        });
+
+        // Persist refund-claim outcomes (when the assistant delegated to the auditor).
+        if (['APPROVED', 'DENIED', 'NEEDS_REVIEW'].includes(result.decision)) {
+            db.query(
+                `INSERT INTO return_claims
+                   (session_id, shop_id, transaction_id, intent, claim_type, decision, confidence, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+                [sessionId, shopId, transaction_id ?? null, result.intent,
+                 result.verification?.claim_type || null, result.decision,
+                 result.verification?.confidence ?? null]
+            ).catch(err => {
+                if (!app._askClaimWarned) { console.warn('return_claims insert skipped:', err.message); app._askClaimWarned = true; }
+            });
+        }
+
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Chatbot ask error:', err.message);
+        return res.status(500).json({ message: 'Assistant error. Please try again.' });
+    }
+});
+
 // GET /api/chatbot/budget — live budget snapshot for the chat UI meter.
 app.get('/api/chatbot/budget', async (req, res) => {
     const sessionId = budgetSessionId(req);
@@ -1287,7 +1397,7 @@ async function sendWelcomeEmail(email, ownerName, shopName) {
 }
 
 async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, timestamp, action, intelligence_flags }) {
-    // Generate AI explanation using Llama via Groq
+    // Generate AI explanation via the Otari LLM gateway
     const aiExplanation = await generateFraudExplanation({
         barcode, product_name, risk_score, action,
         intelligence_flags: intelligence_flags || '',
@@ -1498,6 +1608,7 @@ const server = app.listen(PORT, () => {
     console.log(`🚀 SmartRetail → http://localhost:${PORT}`);
     console.log(`   Redis sessions: enabled`);
     console.log(`   FastAPI proxy:  ${FASTAPI_URL}`);
+    console.log(`   Otari gateway:  ${LLM_ENABLED ? otari.endpoint : 'not configured (LLM fallback → human handoff)'}`);
     console.log(`   WebSocket:      ws://localhost:${PORT}/ws`);
 });
 

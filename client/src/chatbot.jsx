@@ -22,6 +22,26 @@ const DECISION_STYLE = {
   BLOCKED_INJECTION: { color: '#fb923c', label: '🛡️ Blocked' },
 }
 
+// Where each answer came from — proves the bot is NOT just an LLM wrapper.
+const SOURCE_STYLE = {
+  knowledge_base: { color: '#38bdf8', label: '📚 Knowledge Base' },
+  policy:         { color: '#38bdf8', label: '📄 Store Policy' },
+  live_inventory: { color: '#34d399', label: '📦 Live Inventory' },
+  order_lookup:   { color: '#22d3ee', label: '🧾 Order Lookup' },
+  visual_audit:   { color: '#a78bfa', label: '🔬 Visual Audit' },
+  ai_generated:   { color: '#fbbf24', label: '✨ AI (grounded)' },
+  human_handoff:  { color: '#fb923c', label: '🙋 Connect an Agent' },
+  security:       { color: '#fb923c', label: '🛡️ Security' },
+}
+
+const QUICK_REPLIES = [
+  'What is your return policy?',
+  'What are your store hours?',
+  'Which payment methods do you accept?',
+  'Track my order status',
+  'My item arrived damaged, I want a refund',
+]
+
 export default function ChatbotPage() {
   const navigate = useNavigate()
   const budgetSession = useRef(getBudgetSession())
@@ -29,9 +49,10 @@ export default function ChatbotPage() {
 
   const [messages, setMessages] = useState([{
     role: 'bot',
-    text: 'Hi! I\'m the SmartRetail returns assistant. Tell me what went wrong with your purchase, ' +
-          'or ask about our 30-day return policy. If you have a transaction ID, add it below so I can ' +
-          'verify your claim against the image taken at checkout.',
+    text: 'Hi! I\'m the SmartRetail customer assistant. I can help with our return & refund policy, ' +
+          'product availability and prices, order status, store hours, payments, delivery, and warranty. ' +
+          'Ask me anything — and if your item has a problem, I can start a verified refund claim (add your ' +
+          'transaction ID below for that).',
   }])
   const [input, setInput]   = useState('')
   const [txnId, setTxnId]   = useState('')
@@ -57,14 +78,14 @@ export default function ChatbotPage() {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
   }, [messages, sending])
 
-  async function send() {
-    const text = input.trim()
+  async function send(override) {
+    const text = (typeof override === 'string' ? override : input).trim()
     if (!text || sending) return
     setMessages(m => [...m, { role: 'user', text }])
     setInput('')
     setSending(true)
     try {
-      const r = await fetch('/api/chatbot/audit', {
+      const r = await fetch('/api/chatbot/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -79,6 +100,7 @@ export default function ChatbotPage() {
         setMessages(m => [...m, {
           role: 'bot',
           text: data.reply,
+          source: data.source,
           decision: data.decision,
           verification: data.verification,
           routing: data.routing,
@@ -136,8 +158,8 @@ export default function ChatbotPage() {
           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
             <div style={{ width:38, height:38, borderRadius:11, fontSize:19, background:'linear-gradient(135deg,#7c3aed,#4c1d95)', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 0 20px rgba(124,58,237,.5)' }}>🤖</div>
             <div>
-              <div style={{ fontSize:16, fontWeight:800, color:'#fff' }}>Returns <span style={{ color:'#a78bfa' }}>Auditor</span></div>
-              <div style={{ fontSize:9, color:'#4c1d95', letterSpacing:'2px', textTransform:'uppercase' }}>Cost-Aware AI · 30-Day Policy</div>
+              <div style={{ fontSize:16, fontWeight:800, color:'#fff' }}>Customer <span style={{ color:'#a78bfa' }}>Assistant</span></div>
+              <div style={{ fontSize:9, color:'#4c1d95', letterSpacing:'2px', textTransform:'uppercase' }}>Hybrid AI · Grounded Answers</div>
             </div>
           </div>
           <button onClick={() => navigate('/')} style={{ padding:'6px 14px', borderRadius:20, fontSize:11, background:'transparent', border:'1px solid rgba(109,40,217,.3)', color:'#6d28d9', cursor:'pointer' }}>← Exit</button>
@@ -179,6 +201,15 @@ export default function ChatbotPage() {
                 {m.text}
               </div>
 
+              {/* Source badge — shows WHERE the answer came from */}
+              {m.role === 'bot' && m.source && SOURCE_STYLE[m.source] && (
+                <div style={{ marginTop:6 }}>
+                  <span style={{ fontSize:9.5, fontWeight:700, padding:'2px 9px', borderRadius:20, color:SOURCE_STYLE[m.source].color, border:`1px solid ${SOURCE_STYLE[m.source].color}55`, background:`${SOURCE_STYLE[m.source].color}14` }}>
+                    {SOURCE_STYLE[m.source].label}
+                  </span>
+                </div>
+              )}
+
               {/* Decision badge + verification + routing transparency */}
               {m.role === 'bot' && m.decision && DECISION_STYLE[m.decision] && (
                 <div style={{ marginTop:6, display:'flex', flexWrap:'wrap', gap:6, alignItems:'center' }}>
@@ -213,6 +244,17 @@ export default function ChatbotPage() {
           )}
         </div>
 
+        {/* Quick replies */}
+        <div style={{ display:'flex', flexWrap:'wrap', gap:7, padding:'2px 2px 10px' }}>
+          {QUICK_REPLIES.map((q, i) => (
+            <button key={i} onClick={() => send(q)} disabled={sending} style={{
+              padding:'6px 12px', borderRadius:18, fontSize:11, fontFamily:"'Sora',sans-serif",
+              border:'1px solid rgba(109,40,217,.3)', background:'rgba(109,40,217,.07)', color:'#c4b5fd',
+              cursor: sending ? 'not-allowed' : 'pointer', opacity: sending ? .5 : 1,
+            }}>{q}</button>
+          ))}
+        </div>
+
         {/* Composer */}
         <div style={{ paddingBottom:18 }}>
           <div style={{ display:'flex', gap:8, marginBottom:8 }}>
@@ -222,7 +264,7 @@ export default function ChatbotPage() {
           </div>
           <div style={{ display:'flex', gap:8 }}>
             <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') send() }}
-              placeholder="Describe the issue or ask about returns…" disabled={sending}
+              placeholder="Ask a question, or describe an issue with your order…" disabled={sending}
               style={{ flex:1, background:'rgba(109,40,217,.06)', border:'1px solid rgba(109,40,217,.25)', borderRadius:12, color:'#e9d5ff', fontFamily:"'Sora',sans-serif", fontSize:13.5, padding:'13px 16px', outline:'none' }} />
             <button onClick={send} disabled={sending || !input.trim()} style={{
               padding:'13px 22px', borderRadius:12, border:'none', cursor: sending||!input.trim()?'not-allowed':'pointer',
