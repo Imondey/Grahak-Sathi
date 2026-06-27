@@ -1120,6 +1120,7 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
             product_ocr:   product_ocr  || '',
             barcode_ocr:   barcode_ocr   || '',
             yolo_label:    yolo_label    || '',
+            mk_id:         (mk_id && String(mk_id).trim()) || null,
         }, { timeout: 10000 });
         return res.status(200).json(faResp.data);
     } catch {

@@ -4,41 +4,9 @@ from ultralytics import YOLO
 from rapidfuzz import fuzz as rfuzz
 from thefuzz import fuzz
 
-# ── Product Database (replace with PostgreSQL in production) ──
-MOCK_DB = {
-    "8901030823437": {
-        "product_name": "Nestle Milo 500g",
-        "price": 120.00,
-        "barcode_format": "EAN-13",
-        "mk_ids": ["MK-MILO-2024-A001", "MK-MILO-2024-A002", "MK-MILO-2024-A003", "MK-MILO-2024-B001", "MK-MILO-2024-B002"]
-    },
-    "8901491503217": {
-        "product_name": "Bournvita 400g",
-        "price": 95.00,
-        "barcode_format": "EAN-13",
-        "mk_ids": ["MK-BRV-2024-X101", "MK-BRV-2024-X102", "MK-BRV-2024-X103", "MK-BRV-2024-Y201", "MK-BRV-2024-Y202"]
-    },
-    "012345678905": {
-        "product_name": "Colgate 150ml",
-        "price": 65.00,
-        "barcode_format": "UPC-A",
-        "mk_ids": ["MK-CLG-2024-P010", "MK-CLG-2024-P011", "MK-CLG-2024-P012", "MK-CLG-2024-Q020", "MK-CLG-2024-Q021"]
-    },
-    "4006381333931": {
-        "product_name": "Nivea Cream 200ml",
-        "price": 180.00,
-        "barcode_format": "EAN-13",
-        "mk_ids": ["MK-NVA-2024-C301", "MK-NVA-2024-C302", "MK-NVA-2024-C303", "MK-NVA-2024-D401", "MK-NVA-2024-D402"]
-    },
-}
-
-# Helper: validate MK ID for a given barcode
-def validate_mk_id(barcode: str, mk_id: str) -> bool:
-    """Check if the given mk_id belongs to the product identified by barcode."""
-    product = MOCK_DB.get(barcode)
-    if not product:
-        return False
-    return mk_id in product.get("mk_ids", [])
+# ── Product Database (serials live in the lightweight product_catalog module so
+#    MK-ID validation elsewhere doesn't have to import this heavy ML module) ──
+from product_catalog import MOCK_DB, validate_mk_id
 
 TRUST_THRESHOLD = 65
 
