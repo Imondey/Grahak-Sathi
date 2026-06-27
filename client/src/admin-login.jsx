@@ -34,7 +34,7 @@ export default function AdminLoginPage({ setUser }) {
       const data = await res.json()
       if (res.ok) {
         setUser(data.user)
-        navigate('/home')
+        navigate('/chat')
       } else {
         showToast(data.message || 'Login failed.', 'error')
       }

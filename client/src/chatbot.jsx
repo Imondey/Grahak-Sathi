@@ -42,7 +42,7 @@ const QUICK_REPLIES = [
   'My item arrived damaged, I want a refund',
 ]
 
-export default function ChatbotPage() {
+export default function ChatbotPage({ user }) {
   const navigate = useNavigate()
   const budgetSession = useRef(getBudgetSession())
   const scrollRef = useRef(null)
@@ -162,7 +162,16 @@ export default function ChatbotPage() {
               <div style={{ fontSize:9, color:'#4c1d95', letterSpacing:'2px', textTransform:'uppercase' }}>Hybrid AI · Grounded Answers</div>
             </div>
           </div>
-          <button onClick={() => navigate('/')} style={{ padding:'6px 14px', borderRadius:20, fontSize:11, background:'transparent', border:'1px solid rgba(109,40,217,.3)', color:'#6d28d9', cursor:'pointer' }}>← Exit</button>
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            {user ? (
+              <>
+                <button onClick={() => navigate('/checkout')} title="Hardware-store checkout with fraud detection" style={{ padding:'7px 16px', borderRadius:20, fontSize:12, fontWeight:700, background:'linear-gradient(135deg,#7c3aed,#5b21b6)', color:'#fff', border:'none', cursor:'pointer', boxShadow:'0 0 16px rgba(124,58,237,.4)' }}>🛒 Checkout</button>
+                <button onClick={() => navigate('/home')} style={{ padding:'6px 14px', borderRadius:20, fontSize:11, background:'transparent', border:'1px solid rgba(109,40,217,.3)', color:'#6d28d9', cursor:'pointer' }}>🏪 Home</button>
+              </>
+            ) : (
+              <button onClick={() => navigate('/')} style={{ padding:'6px 14px', borderRadius:20, fontSize:11, background:'transparent', border:'1px solid rgba(109,40,217,.3)', color:'#6d28d9', cursor:'pointer' }}>← Exit</button>
+            )}
+          </div>
         </header>
 
         {/* Budget meter */}
