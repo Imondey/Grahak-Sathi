@@ -7,7 +7,9 @@
     "start": "node index.js",
 "build": "cd client && npx vite build",
 "dev": "cd client && npx vite",
-  "preview": "vite preview"
+  "preview": "vite preview",
+  "seed:refund-demo": "node seed-refund-demo.js",
+  "seed:image": "node seed-images.js"
 
 
 
