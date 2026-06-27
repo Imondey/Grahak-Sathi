@@ -33,6 +33,13 @@ const { WebSocketServer } = require('ws');
 const { createClient }    = require('redis');
 const { RedisStore } = require('connect-redis');
 
+// ── Cost-Aware AI layer (Otari challenge) ──────────────────────────────────────
+const aiConfig                = require('./lib/aiConfig');
+const modelRouter             = require('./lib/modelRouter');
+const injectionFilter         = require('./lib/injectionFilter');
+const { createBudgetEngine }  = require('./lib/budgetEngine');
+const { createAuditor }       = require('./lib/auditor');
+
 const app         = express();
 const PORT        = process.env.PORT || 3000;
 const FASTAPI_URL = process.env.FASTAPI_URL || 'http://localhost:8000';
@@ -85,6 +92,65 @@ const redisClient = createClient({
 redisClient.connect()
     .then(() => console.log('✅ Redis connected'))
     .catch(err => { console.error('❌ Redis connection failed:', err.message); });
+
+// ── Cost-Aware AI: budget engine + conversational auditor ──────────────────────
+const HAS_GROQ_KEY = !!process.env.GROQ_API_KEY;
+const budgetEngine = createBudgetEngine(redisClient);
+
+// Persist a model-usage record for the transparency dashboard (fire-and-forget).
+async function logUsage({ sessionId, shopId, taskType, tier, model, cost, latencyMs }) {
+    try {
+        await db.query(
+            `INSERT INTO model_usage (session_id, shop_id, task_type, tier, model, cost_usd, latency_ms, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+            [sessionId, shopId, taskType, tier, model, cost || 0, latencyMs || null]
+        );
+    } catch (err) {
+        // Table may not exist yet (pre-migration) — log once, never break the request.
+        if (!logUsage._warned) { console.warn('model_usage insert skipped:', err.message); logUsage._warned = true; }
+    }
+}
+
+// Persist a detected prompt-injection event.
+async function logInjection({ sessionId, shopId, rawInput, stage, pattern }) {
+    try {
+        await db.query(
+            `INSERT INTO injection_events (session_id, shop_id, raw_input, stage, pattern, created_at)
+             VALUES ($1,$2,$3,$4,$5,NOW())`,
+            [sessionId, shopId, String(rawInput || '').slice(0, 1000), stage, pattern]
+        );
+    } catch (err) {
+        if (!logInjection._warned) { console.warn('injection_events insert skipped:', err.message); logInjection._warned = true; }
+    }
+    console.warn(`🛡️ Prompt injection blocked (stage ${stage}, ${pattern}) session=${sessionId}`);
+}
+
+// Retrieve the live checkout image saved for a transaction (Customer DB).
+async function getCheckoutImage(transactionId) {
+    try {
+        const r = await db.query(
+            `SELECT image_b64 FROM checkout_images WHERE transaction_id = $1 ORDER BY created_at DESC LIMIT 1`,
+            [transactionId]
+        );
+        if (r.rows.length > 0 && r.rows[0].image_b64) return { image_b64: r.rows[0].image_b64 };
+    } catch (err) {
+        if (!getCheckoutImage._warned) { console.warn('checkout_images read skipped:', err.message); getCheckoutImage._warned = true; }
+    }
+    return null;
+}
+
+const auditor = createAuditor({
+    groqClient,
+    axios,
+    fastapiUrl: FASTAPI_URL,
+    budget:     budgetEngine,
+    router:     modelRouter,
+    injection:  injectionFilter,
+    hasGroqKey: HAS_GROQ_KEY,
+    logUsage,
+    logInjection,
+    getCheckoutImage,
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FRAUD INTELLIGENCE — Scan Frequency + Barcode Age Tracking
@@ -1046,6 +1112,139 @@ app.get('/api/health', async (req, res) => {
     try { await redisClient.ping(); redisOk = true; } catch {}
     try { await db.query('SELECT 1'); dbOk = true; } catch {}
     res.json({ redis: redisOk ? 'connected' : 'disconnected', db: dbOk ? 'connected' : 'disconnected', time: new Date().toISOString() });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COST-AWARE AI — Conversational Auditor, Budget & Usage Transparency (Otari)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Resolve the budget session id for a request. Public returns-chatbot visitors
+// supply a stable client-generated id; logged-in flows fall back to express sid.
+function budgetSessionId(req) {
+    const fromBody  = req.body && typeof req.body.budget_session === 'string' && req.body.budget_session.trim();
+    const fromQuery = typeof req.query.budget_session === 'string' && req.query.budget_session.trim();
+    return (fromBody || fromQuery || req.sessionID || 'anon').toString().slice(0, 64);
+}
+
+// POST /api/chatbot/audit — Post-Purchase Conversational Auditor (public).
+app.post('/api/chatbot/audit', async (req, res) => {
+    const { message, transaction_id, image_b64 } = req.body || {};
+    if (!message || typeof message !== 'string' || !message.trim())
+        return res.status(400).json({ message: 'A message is required.' });
+    if (message.length > 4000)
+        return res.status(413).json({ message: 'Message too long.' });
+
+    const sessionId = budgetSessionId(req);
+    const shopId    = req.session?.user?.id || null;
+
+    try {
+        const result = await auditor.handleMessage({
+            sessionId,
+            shopId,
+            message: message.trim(),
+            transactionId: transaction_id ?? null,
+            imageB64: image_b64 || null,
+        });
+
+        // Persist the claim outcome for the manager dashboard / audit trail.
+        if (['APPROVED', 'DENIED', 'NEEDS_REVIEW'].includes(result.decision)) {
+            db.query(
+                `INSERT INTO return_claims
+                   (session_id, shop_id, transaction_id, intent, claim_type, decision, confidence, created_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())`,
+                [sessionId, shopId, transaction_id ?? null, result.intent,
+                 result.verification?.claim_type || null, result.decision,
+                 result.verification?.confidence ?? null]
+            ).catch(err => {
+                if (!app._claimWarned) { console.warn('return_claims insert skipped:', err.message); app._claimWarned = true; }
+            });
+        }
+
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('Chatbot audit error:', err.message);
+        return res.status(500).json({ message: 'Auditor error. Please try again.' });
+    }
+});
+
+// GET /api/chatbot/budget — live budget snapshot for the chat UI meter.
+app.get('/api/chatbot/budget', async (req, res) => {
+    const sessionId = budgetSessionId(req);
+    const snap = await budgetEngine.snapshot(sessionId);
+    res.json({ ...snap, tiers: aiConfig.TIERS });
+});
+
+// POST /api/chatbot/reset-budget — start a fresh visitor session.
+app.post('/api/chatbot/reset-budget', async (req, res) => {
+    const sessionId = budgetSessionId(req);
+    const snap = await budgetEngine.reset(sessionId);
+    res.json({ ...snap, reset: true });
+});
+
+// GET /api/admin/usage-transparency — manager dashboard metrics (admin only).
+app.get('/api/admin/usage-transparency', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    const out = {
+        budgetLimit: aiConfig.BUDGET_LIMIT,
+        tiers: aiConfig.TIERS,
+        spendByTier: [],
+        totalSpend: 0,
+        totalCalls: 0,
+        avgLatencyMs: null,
+        injectionCount: 0,
+        injectionByStage: [],
+        claims: { approved: 0, denied: 0, review: 0 },
+        recentInjections: [],
+        recentClaims: [],
+    };
+    try {
+        const tierRows = await db.query(
+            `SELECT tier, COUNT(*)::int AS calls, COALESCE(SUM(cost_usd),0)::float AS spend,
+                    AVG(latency_ms)::float AS avg_latency
+               FROM model_usage WHERE shop_id = $1 AND created_at::date = CURRENT_DATE
+              GROUP BY tier`,
+            [shopId]
+        );
+        out.spendByTier = tierRows.rows;
+        out.totalSpend  = parseFloat(tierRows.rows.reduce((s, r) => s + (r.spend || 0), 0).toFixed(4));
+        out.totalCalls  = tierRows.rows.reduce((s, r) => s + (r.calls || 0), 0);
+        const lat = tierRows.rows.map(r => r.avg_latency).filter(Boolean);
+        out.avgLatencyMs = lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : null;
+
+        const injRows = await db.query(
+            `SELECT stage, COUNT(*)::int AS count FROM injection_events
+              WHERE shop_id = $1 AND created_at::date = CURRENT_DATE GROUP BY stage`,
+            [shopId]
+        );
+        out.injectionByStage = injRows.rows;
+        out.injectionCount   = injRows.rows.reduce((s, r) => s + (r.count || 0), 0);
+
+        const claimRows = await db.query(
+            `SELECT decision, COUNT(*)::int AS count FROM return_claims
+              WHERE shop_id = $1 AND created_at::date = CURRENT_DATE GROUP BY decision`,
+            [shopId]
+        );
+        for (const r of claimRows.rows) {
+            if (r.decision === 'APPROVED')     out.claims.approved = r.count;
+            else if (r.decision === 'DENIED')  out.claims.denied   = r.count;
+            else                               out.claims.review  += r.count;
+        }
+
+        out.recentInjections = (await db.query(
+            `SELECT stage, pattern, LEFT(raw_input, 120) AS snippet, created_at
+               FROM injection_events WHERE shop_id = $1 ORDER BY created_at DESC LIMIT 8`,
+            [shopId]
+        )).rows;
+
+        out.recentClaims = (await db.query(
+            `SELECT intent, claim_type, decision, confidence, created_at
+               FROM return_claims WHERE shop_id = $1 ORDER BY created_at DESC LIMIT 8`,
+            [shopId]
+        )).rows;
+    } catch (err) {
+        if (!app._usageWarned) { console.warn('usage-transparency query degraded (run migration_otari.sql):', err.message); app._usageWarned = true; }
+    }
+    res.json(out);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
