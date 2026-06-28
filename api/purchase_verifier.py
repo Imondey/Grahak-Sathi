@@ -1,5 +1,5 @@
 """
-SmartRetail — Purchase Verification Engine (anti-fraud refund check)
+Grahak Sathi — Purchase Verification Engine (anti-fraud refund check)
 ────────────────────────────────────────────────────────────────────
 When a customer uploads a photo to complain about a product, we recognise the
 product's MK-ID (manufacturer serial) and check whether that MK-ID exists in

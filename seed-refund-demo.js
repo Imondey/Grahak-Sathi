@@ -1,5 +1,5 @@
 /**
- * SmartRetail — Refund demo seeder (one command)
+ * Grahak Sathi — Refund demo seeder (one command)
  * ───────────────────────────────────────────────
  * Creates two ready-to-use test transactions so you can try the refund flow in
  * the chatbot WITHOUT going through a live checkout:

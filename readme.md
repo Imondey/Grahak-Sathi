@@ -1,12 +1,12 @@
-# Nyatik Nayan
+# Grahak Sathi
 
-An intelligent retail fraud detection and checkout management platform built for **HackArena 2.0**. Nyatik Nayan enables store admins to manage customer sessions, scan product barcodes at checkout, and instantly detect counterfeit or mismatched goods using AI-powered verification, real-time fraud scoring, and automated alerting.
+An intelligent retail fraud detection and checkout management platform built for **HackArena 2.0**. Grahak Sathi enables store admins to manage customer sessions, scan product barcodes at checkout, and instantly detect counterfeit or mismatched goods using AI-powered verification, real-time fraud scoring, and automated alerting.
 
 ---
 
 ## What It Does
 
-When a cashier or customer scans a barcode, Nyatik Nayan runs it through a multi-layer verification pipeline in under a second. It cross-references your inventory database, analyzes scan frequency and barcode age for anomalies, validates manufacturer serial numbers (MK IDs), computes a fraud risk score, and either approves the transaction or blocks it — flashing the result on screen and firing an email alert (with AI-generated explanation) if fraud is detected.
+When a cashier or customer scans a barcode, Grahak Sathi runs it through a multi-layer verification pipeline in under a second. It cross-references your inventory database, analyzes scan frequency and barcode age for anomalies, validates manufacturer serial numbers (MK IDs), computes a fraud risk score, and either approves the transaction or blocks it — flashing the result on screen and firing an email alert (with AI-generated explanation) if fraud is detected.
 
 ---
 

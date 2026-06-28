@@ -1,5 +1,5 @@
 /**
- * SmartRetail — Refund image seeder
+ * Grahak Sathi — Refund image seeder
  * ──────────────────────────────────
  * Loads an image file from disk, base64-encodes it, and inserts it into the
  * Customer DB (checkout_images) or Delivery DB (delivery_images) under a given

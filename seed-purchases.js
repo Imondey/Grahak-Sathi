@@ -1,5 +1,5 @@
 /**
- * SmartRetail — Customer purchase-history seeder (anti-fraud refund demo)
+ * Grahak Sathi — Customer purchase-history seeder (anti-fraud refund demo)
  * ──────────────────────────────────────────────────────────────────────
  * Seeds the customer_purchases table with the demo users/orders so the refund
  * purchase-verification flow can be tested: a complaint is only accepted if the

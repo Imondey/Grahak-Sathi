@@ -143,7 +143,7 @@ export default function HomePage({ user, setUser }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
             <div style={{ width: 38, height: 38, borderRadius: 11, fontSize: 19, background: 'linear-gradient(135deg, #7c3aed, #4c1d95)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 22px rgba(124,58,237,.55)' }}>🛒</div>
             <div>
-              <div style={{ fontSize: 17, fontWeight: 800, color: '#fff', letterSpacing: '-.4px' }}>Nyatik<span style={{ color: '#a78bfa' }}>Nayan</span></div>
+              <div style={{ fontSize: 17, fontWeight: 800, color: '#fff', letterSpacing: '-.4px' }}>Grahak<span style={{ color: '#a78bfa' }}>Sathi</span></div>
               <div style={{ fontSize: 9, color: '#4c1d95', letterSpacing: '2.2px', textTransform: 'uppercase' }}>Retail Intelligence</div>
             </div>
           </div>
@@ -171,7 +171,7 @@ export default function HomePage({ user, setUser }) {
           </div>
 
           <h1 style={{ fontSize: 'clamp(36px,5vw,60px)', fontWeight: 800, lineHeight: 1.1, letterSpacing: '-2px', color: '#fff', marginBottom: 16, marginTop: 20 }}>
-            Smart Retail <span style={{ color: '#a78bfa' }}>Verification</span>
+            Grahak Sathi <span style={{ color: '#a78bfa' }}>Verification</span>
           </h1>
           <p style={{ fontSize: 15, color: 'rgba(255,255,255,.3)', maxWidth: 560, margin: '0 auto 40px', lineHeight: 1.7, fontWeight: 400 }}>
             AI-powered product verification using YOLOv8 + OCR. Scan barcodes, capture product images via webcam, and verify against your inventory database in real-time.
@@ -314,7 +314,7 @@ export default function HomePage({ user, setUser }) {
         }}>
           <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#86efac', boxShadow: '0 0 8px #86efac', animation: 'blink 2.5s ease-in-out infinite' }} />
           <span style={{ fontSize: 10, color: '#4c1d95', fontFamily: 'monospace', letterSpacing: '1px' }}>
-            NyatikNayan · Team Schrodinger · Smart Retail Intelligence Platform
+            Grahak Sathi · Team Schrodinger · Grahak Sathi Intelligence Platform
           </span>
         </div>
       </div>

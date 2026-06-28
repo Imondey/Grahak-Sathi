@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
--- SmartRetail — Admin-Controlled Session Management Migration
+-- Grahak Sathi — Admin-Controlled Session Management Migration
 -- Run this ONCE against your PostgreSQL database (Netra)
 -- ═══════════════════════════════════════════════════════════════════════════════
 
@@ -38,4 +38,4 @@ CREATE INDEX IF NOT EXISTS idx_customer_sessions_admin_active ON customer_sessio
 -- To generate your own: node -e "require('bcrypt').hash('YOUR_CODE',10).then(console.log)"
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- INSERT INTO admins (email, owner_name, shop_name, unique_code, shop_id)
--- VALUES ('admin@smartretail.com', 'Admin', 'SmartRetail Store', '<bcrypt_hash_here>', 1);
+-- VALUES ('admin@grahaksathi.com', 'Admin', 'Grahak Sathi Store', '<bcrypt_hash_here>', 1);

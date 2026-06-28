@@ -1,5 +1,5 @@
 """
-SmartRetail — Prompt-Injection LSTM Classifier (self-hosted, no external AI)
+Grahak Sathi — Prompt-Injection LSTM Classifier (self-hosted, no external AI)
 ────────────────────────────────────────────────────────────────────────────
 A small PyTorch LSTM trained locally to flag prompt-injection / jailbreak /
 evasion attempts. It runs entirely on your own hardware (no HuggingFace, no

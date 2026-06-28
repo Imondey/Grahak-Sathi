@@ -1,5 +1,5 @@
 /**
- * SmartRetail — Node.js Express Gateway
+ * Grahak Sathi — Node.js Express Gateway
  * ─────────────────────────────────────
  * Responsibilities:
  *  1. Auth (login/signup) with Redis-backed sessions
@@ -365,7 +365,7 @@ app.use(express.urlencoded({ extended: true, limit: process.env.JSON_BODY_LIMIT 
 // ── Redis-backed Session Store ────────────────────────────────────────────────
 app.use(session({
     store:             new RedisStore({ client: redisClient }),
-    secret:            process.env.SESSION_SECRET || 'smartretail_secret',
+    secret:            process.env.SESSION_SECRET || 'grahaksathi_secret',
     resave:            false,
         secure: false,    
     sameSite: 'lax',
@@ -1543,20 +1543,20 @@ async function sendWelcomeEmail(email, ownerName, shopName) {
         auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
     });
     await transporter.sendMail({
-        from: `"SmartRetail" <${process.env.MAIL_USER}>`,
+        from: `"Grahak Sathi" <${process.env.MAIL_USER}>`,
         to:    email,
-        subject: `Welcome to Nyatik Nayan, ${ownerName}! 🛒`,
+        subject: `Welcome to Grahak Sathi, ${ownerName}! 🛒`,
         html: `
         <div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#060912;color:#e2e8f0;padding:32px;border-radius:16px;border:1px solid #1a2540">
           <h1 style="font-size:24px;background:linear-gradient(90deg,#00e5ff,#7c3aed);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin:0 0 8px">
-            Welcome to SmartRetail!
+            Welcome to Grahak Sathi!
           </h1>
           <p style="color:#64748b;margin:0 0 24px">Your intelligent retail platform is ready.</p>
           <div style="background:#0d1525;border:1px solid #1a2540;border-radius:12px;padding:20px;margin-bottom:24px">
             <p style="margin:0 0 8px"><strong>👤 Owner:</strong> ${ownerName}</p>
             <p style="margin:0"><strong>🏪 Store:</strong> ${shopName}</p>
           </div>
-          <a href="${process.env.APP_URL || 'https://github.com/Debarghyasg/Nyatik-Nayan'}"
+          <a href="${process.env.APP_URL || 'https://github.com/Debarghyasg/Grahak-Sathi'}"
              style="display:inline-block;margin-top:20px;padding:12px 28px;background:linear-gradient(135deg,#00e5ff,#7c3aed);color:#fff;font-weight:700;border-radius:10px;text-decoration:none">
             Open Dashboard →
           </a>
@@ -1583,7 +1583,7 @@ async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, ti
 
     await sgMail.send({
         to:      shop.email,
-        from:    process.env.SENDGRID_FROM || 'alerts@smartretail.com',
+        from:    process.env.SENDGRID_FROM || 'alerts@grahaksathi.com',
         subject: `🚨 Fraud Alert — ${barcode} blocked at ${shop.shop_name}`,
         html: `
         <div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#0d0507;color:#e2e8f0;padding:32px;border-radius:16px;border:1px solid #4a0d0f">
@@ -1618,7 +1618,7 @@ async function sendLowStockEmail(shop, lowStockItems) {
 
     await sgMail.send({
         to:      shop.email,
-        from:    process.env.SENDGRID_FROM || 'alerts@smartretail.com',
+        from:    process.env.SENDGRID_FROM || 'alerts@grahaksathi.com',
         subject: `⚠️ Low Stock Warning — ${lowStockItems.length} item${lowStockItems.length > 1 ? 's' : ''} at ${shop.shop_name}`,
         html: `
         <div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#0d0a05;color:#e2e8f0;padding:32px;border-radius:16px;border:1px solid #4a3a0d">
@@ -1639,7 +1639,7 @@ async function sendLowStockEmail(shop, lowStockItems) {
             <tbody>${rows}</tbody>
           </table>
           <p style="margin-top:24px;font-size:12px;color:#64748b">
-            Threshold: ${LOW_STOCK_THRESHOLD} units · Sent automatically by SmartRetail · ${new Date().toLocaleString('en-IN')}
+            Threshold: ${LOW_STOCK_THRESHOLD} units · Sent automatically by Grahak Sathi · ${new Date().toLocaleString('en-IN')}
           </p>
         </div>`,
     });
@@ -1649,7 +1649,7 @@ async function sendLowStockEmail(shop, lowStockItems) {
 async function sendFraudIncidentReport(shop, barcode, verifyResult, flagData) {
     await sgMail.send({
         to:      shop.email,
-        from:    process.env.SENDGRID_FROM || 'alerts@smartretail.com',
+        from:    process.env.SENDGRID_FROM || 'alerts@grahaksathi.com',
         subject: `🔴 INCIDENT REPORT — Barcode ${barcode} flagged ${flagData.count}× in 24h at ${shop.shop_name}`,
         html: `
         <div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#0d0507;color:#e2e8f0;padding:32px;border-radius:16px;border:2px solid #ff4455">
@@ -1659,7 +1659,7 @@ async function sendFraudIncidentReport(shop, barcode, verifyResult, flagData) {
           <p><strong>First seen:</strong> ${flagData.first_seen}</p>
           <p><strong>Last seen:</strong>  ${flagData.last_seen}</p>
           <p><strong>Product:</strong> ${verifyResult.product_name || 'Not found in inventory'}</p>
-          <p style="color:#64748b;font-size:12px;margin-top:20px">Immediate action required. Contact SmartRetail support if you suspect counterfeit goods.</p>
+          <p style="color:#64748b;font-size:12px;margin-top:20px">Immediate action required. Contact Grahak Sathi support if you suspect counterfeit goods.</p>
         </div>`,
     });
     console.log(`📧 Incident report → ${shop.email} for barcode ${barcode}`);
@@ -1686,7 +1686,7 @@ cron.schedule('0 20 * * *', async () => {
 
             await sgMail.send({
                 to:   shop.email,
-                from: process.env.SENDGRID_FROM || 'alerts@smartretail.com',
+                from: process.env.SENDGRID_FROM || 'alerts@grahaksathi.com',
                 subject: `📊 Daily Summary — ${shop.shop_name} — ${new Date().toLocaleDateString('en-IN')}`,
                 html: `
                 <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#060912;color:#e2e8f0;padding:28px;border-radius:14px;border:1px solid #1a2540">
@@ -1774,7 +1774,7 @@ function broadcastToShop(shopId, payload) {
 }
 
 const server = app.listen(PORT, () => {
-    console.log(`🚀 SmartRetail → http://localhost:${PORT}`);
+    console.log(`🚀 Grahak Sathi → http://localhost:${PORT}`);
     console.log(`   Redis sessions: enabled`);
     console.log(`   FastAPI proxy:  ${FASTAPI_URL}`);
     console.log(`   Otari gateway:  ${LLM_ENABLED ? otari.endpoint : 'not configured (LLM fallback → human handoff)'}`);

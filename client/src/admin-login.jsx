@@ -86,7 +86,7 @@ export default function AdminLoginPage({ setUser }) {
           {/* Title bar */}
           <div style={{ display:'flex', alignItems:'center', gap:6, padding:'10px 16px', background:'rgba(0,0,0,.5)', borderBottom:'1px solid rgba(109,40,217,.2)' }}>
             {['#ff5f57','#febc2e','#28c840'].map((c,i) => <div key={i} style={{ width:9, height:9, borderRadius:'50%', background:c, opacity:.6 }} />)}
-            <span style={{ marginLeft:10, fontSize:9, color:'#7c3aed', fontFamily:'monospace', letterSpacing:'.4px' }}>smartretail.ai/admin-login</span>
+            <span style={{ marginLeft:10, fontSize:9, color:'#7c3aed', fontFamily:'monospace', letterSpacing:'.4px' }}>grahaksathi.ai/admin-login</span>
           </div>
           <div style={{ height:2, background:'linear-gradient(90deg, transparent, #7c3aed 40%, #a78bfa 70%, transparent)' }} />
 

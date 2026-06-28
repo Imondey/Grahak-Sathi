@@ -142,7 +142,7 @@ function BrowserCard({ children, glowColor = '#7c3aed', style }) {
           background: 'rgba(109,40,217,.14)', border: '1px solid rgba(109,40,217,.22)',
           display: 'flex', alignItems: 'center', paddingLeft: 8,
         }}>
-          <span style={{ fontSize: 9, color: '#7c3aed', fontFamily: 'monospace', opacity: .75, letterSpacing: '.4px' }}>smartretail.ai/login</span>
+          <span style={{ fontSize: 9, color: '#7c3aed', fontFamily: 'monospace', opacity: .75, letterSpacing: '.4px' }}>grahaksathi.ai/login</span>
         </div>
       </div>
       {/* Top accent line */}
@@ -329,7 +329,7 @@ export default function LoginPage({ setUser }) {
           }}>🛒</div>
           <div>
             <div style={{ fontSize: 18, fontWeight: 800, color: '#fff', letterSpacing: '-.4px', lineHeight: 1.1 }}>
-              Nyatik<span style={{ color: '#a78bfa' }}>Nayan</span>
+              Grahak<span style={{ color: '#a78bfa' }}>Sathi</span>
             </div>
             <div style={{ fontSize: 9, color: '#4c1d95', letterSpacing: '2px', textTransform: 'uppercase' }}>Retail Intelligence</div>
           </div>

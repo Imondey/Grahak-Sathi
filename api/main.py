@@ -1,5 +1,5 @@
 """
-SmartRetail — FastAPI Core Verification Engine
+Grahak Sathi — FastAPI Core Verification Engine
 Port: 8000
 
 pip install fastapi uvicorn asyncpg rapidfuzz python-dotenv redis aioredis ultralytics opencv-python numpy
@@ -25,7 +25,7 @@ import purchase_verifier # anti-fraud: cross-check complaint product vs purchase
 
 load_dotenv()
 
-app = FastAPI(title="SmartRetail Verification Engine", version="1.0.0")
+app = FastAPI(title="Grahak Sathi Verification Engine", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -334,7 +334,7 @@ def _image_similarity(img_a, img_b) -> float:
 
 @app.get("/")
 def root():
-    return {"service": "SmartRetail FastAPI Engine", "status": "running"}
+    return {"service": "Grahak Sathi FastAPI Engine", "status": "running"}
 
 
 @app.get("/health")

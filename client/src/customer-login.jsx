@@ -75,7 +75,7 @@ export default function CustomerLoginPage({ setUser }) {
         <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:32 }}>
           <div style={{ width:44, height:44, borderRadius:13, fontSize:22, background:'linear-gradient(135deg, #059669, #065f46)', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 0 26px rgba(34,197,94,.5)' }}>🛒</div>
           <div>
-            <div style={{ fontSize:20, fontWeight:800, color:'#fff', letterSpacing:'-.5px' }}>Nyatik<span style={{ color:'#86efac' }}>Nayan</span></div>
+            <div style={{ fontSize:20, fontWeight:800, color:'#fff', letterSpacing:'-.5px' }}>Grahak<span style={{ color:'#86efac' }}>Sathi</span></div>
             <div style={{ fontSize:9, color:'#065f46', letterSpacing:'2px', textTransform:'uppercase' }}>Customer Checkout</div>
           </div>
         </div>
@@ -89,7 +89,7 @@ export default function CustomerLoginPage({ setUser }) {
         }}>
           <div style={{ display:'flex', alignItems:'center', gap:6, padding:'10px 16px', background:'rgba(0,0,0,.5)', borderBottom:'1px solid rgba(34,197,94,.2)' }}>
             {['#ff5f57','#febc2e','#28c840'].map((c,i) => <div key={i} style={{ width:9, height:9, borderRadius:'50%', background:c, opacity:.6 }} />)}
-            <span style={{ marginLeft:10, fontSize:9, color:'#059669', fontFamily:'monospace', letterSpacing:'.4px' }}>smartretail.ai/customer</span>
+            <span style={{ marginLeft:10, fontSize:9, color:'#059669', fontFamily:'monospace', letterSpacing:'.4px' }}>grahaksathi.ai/customer</span>
           </div>
           <div style={{ height:2, background:'linear-gradient(90deg, transparent, #34d399 40%, #86efac 70%, transparent)' }} />
 

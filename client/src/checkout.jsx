@@ -257,7 +257,7 @@ export default function CheckoutPage({ user, setUser }) {
         <div style={{display:'flex',alignItems:'center',gap:10}}>
           <div style={{width:34,height:34,borderRadius:9,background:'linear-gradient(135deg,#7c3aed,#4c1d95)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,boxShadow:'0 0 18px rgba(124,58,237,.5)'}}>🛒</div>
           <div>
-            <span style={{fontFamily:"'Sora',sans-serif",fontSize:16,fontWeight:800,letterSpacing:'-.3px',color:'#fff'}}>Nyatik<span style={{color:'#a78bfa'}}>Nayan</span></span>
+            <span style={{fontFamily:"'Sora',sans-serif",fontSize:16,fontWeight:800,letterSpacing:'-.3px',color:'#fff'}}>Grahak<span style={{color:'#a78bfa'}}>Sathi</span></span>
             <span style={{fontFamily:'monospace',fontSize:9,color:'#4c1d95',letterSpacing:'1.5px',textTransform:'uppercase',marginLeft:8}}>/ Checkout Terminal</span>
           </div>
         </div>

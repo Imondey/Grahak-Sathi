@@ -1,5 +1,5 @@
 -- ============================================================================
--- SmartRetail — Otari Cost-Aware AI Layer: schema migration
+-- Grahak Sathi — Otari Cost-Aware AI Layer: schema migration
 -- ============================================================================
 -- Adds the tables that back:
 --   • Usage transparency (AI model cost + latency per call)

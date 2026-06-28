@@ -49,7 +49,7 @@ export default function ChatbotPage({ user }) {
 
   const [messages, setMessages] = useState([{
     role: 'bot',
-    text: 'Hi! I\'m the SmartRetail customer assistant. I can help with our return & refund policy, ' +
+    text: 'Hi! I\'m the Grahak Sathi customer assistant. I can help with our return & refund policy, ' +
           'product availability and prices, order status, store hours, payments, delivery, and warranty. ' +
           'Ask me anything — and if your item has a problem, I can start a verified refund claim (add your ' +
           'transaction ID below for that).',
