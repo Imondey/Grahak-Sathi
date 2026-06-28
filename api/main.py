@@ -78,6 +78,22 @@ async def startup():
     except Exception as e:
         print(f"⚠️  YOLO load failed ({e}) — running without visual verification")
 
+    # Warm-up inference: the FIRST call into a freshly-loaded YOLO model pays a
+    # one-off lazy initialisation cost (kernel/graph setup) that can take several
+    # seconds. Running one throwaway inference here — off the event loop — means
+    # the FIRST real refund scan is already warm and won't trip the client's
+    # 30s timeout. Best-effort; never fatal.
+    try:
+        _warm_img = np.zeros((320, 320, 3), dtype=np.uint8)
+        if yolo_model is not None:
+            await asyncio.to_thread(lambda: yolo_model(_warm_img, verbose=False))
+        if general_model is not None:
+            await asyncio.to_thread(lambda: general_model(_warm_img, verbose=False))
+        if yolo_model is not None or general_model is not None:
+            print("✅ YOLO warm-up inference complete (first refund scan will be fast)")
+    except Exception as e:
+        print(f"ℹ️  YOLO warm-up skipped ({e}) — first scan may be slightly slower")
+
     # Train/load the local prompt-injection LSTM (Stage-2 classifier).
     try:
         if injection_model.load_or_train():
@@ -531,8 +547,10 @@ async def verify_refund(req: RefundVerifyRequest):
         return out
 
     # 2. Resolve the product that was sold.
+    #    Import the serials from the LIGHTWEIGHT product_catalog (NOT ai_core),
+    #    so this request never triggers the heavy YOLO + EasyOCR module load.
     try:
-        from ai_core import MOCK_DB
+        from product_catalog import MOCK_DB
     except Exception:
         MOCK_DB = {}
     sold = MOCK_DB.get(barcode) if barcode else None
@@ -700,8 +718,11 @@ async def refund_pickup(req: RefundPickupRequest):
         return out
 
     # 3. Match the recognised identifier against this transaction's checkout record.
+    #    Serials come from the LIGHTWEIGHT product_catalog module, NOT ai_core —
+    #    importing ai_core here would load YOLO + EasyOCR a second time and block
+    #    the event loop, which is what made the FIRST refund scan time out.
     try:
-        from ai_core import MOCK_DB
+        from product_catalog import MOCK_DB
     except Exception:
         MOCK_DB = {}
 
@@ -872,7 +893,7 @@ async def verify_barcode(req: VerifyRequest):
     mk_id_valid = None
     mk_id_message = None
     if req.mk_id:
-        from ai_core import validate_mk_id, MOCK_DB
+        from product_catalog import validate_mk_id, MOCK_DB
         mk_id_valid = validate_mk_id(req.barcode, req.mk_id)
         if not mk_id_valid:
             mk_id_message = f"MK ID '{req.mk_id}' does not match barcode {req.barcode} — possible counterfeit unit."
@@ -898,7 +919,7 @@ async def verify_barcode(req: VerifyRequest):
 @app.get("/mk-ids")
 async def get_mk_ids(barcode: str):
     """Return the list of valid manufacturer serial numbers for a given barcode."""
-    from ai_core import MOCK_DB
+    from product_catalog import MOCK_DB
     product = MOCK_DB.get(barcode)
     if not product:
         return {"found": False, "barcode": barcode, "mk_ids": []}

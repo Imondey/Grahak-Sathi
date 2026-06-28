@@ -42,6 +42,18 @@ const QUICK_REPLIES = [
   'My item arrived damaged, I want a refund',
 ]
 
+// ── Usage transparency helpers ─────────────────────────────────────────────────
+// Friendly names for the backing model/engine of each tier, so the user sees
+// WHICH model handled their request (not just an internal id).
+const MODEL_LABELS = {
+  'rule-engine':     'Rule Engine',
+  'security-lstm':   'Security LSTM',
+  'yolo-vision-v10': 'YOLO Vision',
+}
+const modelLabel = (m) => MODEL_LABELS[m] || m || '—'
+const taskLabel  = (t) => (t ? String(t).replace(/_/g, ' ') : '')
+
+
 export default function ChatbotPage({ user }) {
   const navigate = useNavigate()
   const budgetSession = useRef(getBudgetSession())
@@ -263,15 +275,56 @@ export default function ChatbotPage({ user }) {
                   )}
                 </div>
               )}
-              {m.role === 'bot' && Array.isArray(m.routing) && m.routing.length > 0 && (
-                <div style={{ marginTop:6, display:'flex', flexWrap:'wrap', gap:5 }}>
-                  {m.routing.map((r, j) => (
-                    <span key={j} title={r.reason} style={{ fontSize:8.5, fontFamily:'monospace', letterSpacing:'.5px', padding:'2px 7px', borderRadius:6, textTransform:'uppercase', color:TIER_COLORS[r.tier] || '#94a3b8', border:`1px solid ${(TIER_COLORS[r.tier]||'#94a3b8')}44`, background:`${(TIER_COLORS[r.tier]||'#94a3b8')}11` }}>
-                      {r.tier}{r.degraded ? ' ↓' : ''} · {r.taskType}
-                    </span>
-                  ))}
-                </div>
-              )}
+              {/* ── Usage Transparency ─────────────────────────────────────
+                  Shows the SELECTED MODEL, the ROUTING REASON, and the
+                  REQUEST COST for this reply — the core Otari requirement. */}
+              {m.role === 'bot' && Array.isArray(m.routing) && m.routing.length > 0 && (() => {
+                const steps = m.routing
+                const requestCost = steps.reduce((s, r) => s + (r.denied ? 0 : (r.estCost || 0)), 0)
+                // The model that actually produced the answer = last non-denied step.
+                const primary = [...steps].reverse().find(r => !r.denied) || steps[steps.length - 1]
+                const pColor = TIER_COLORS[primary.tier] || '#c4b5fd'
+                return (
+                  <div style={{ marginTop:7, background:'rgba(8,3,18,.6)', border:'1px solid rgba(109,40,217,.18)', borderRadius:10, padding:'8px 11px' }}>
+                    {/* Header: selected model + total request cost */}
+                    <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:8, marginBottom:7, flexWrap:'wrap' }}>
+                      <span style={{ fontSize:8.5, fontFamily:'monospace', letterSpacing:'1.2px', textTransform:'uppercase', color:'#7c5cc4' }}>🔎 Usage Transparency</span>
+                      <span style={{ fontSize:9.5, fontFamily:'monospace', color:'#94a3b8' }}>
+                        Model <b style={{ color:pColor }}>{modelLabel(primary.model)}</b>
+                        <span style={{ color:'#4c1d95' }}>{'  ·  '}</span>
+                        Cost <b style={{ color:'#34d399' }}>${requestCost.toFixed(4)}</b>
+                      </span>
+                    </div>
+                    {/* Per-step breakdown: tier · model · reason · cost */}
+                    <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+                      {steps.map((r, j) => {
+                        const c = TIER_COLORS[r.tier] || '#94a3b8'
+                        return (
+                          <div key={j} style={{ display:'flex', alignItems:'flex-start', gap:7 }}>
+                            <span style={{ flexShrink:0, marginTop:1, fontSize:8.5, fontFamily:'monospace', letterSpacing:'.5px', padding:'2px 7px', borderRadius:6, textTransform:'uppercase', color:c, border:`1px solid ${c}44`, background:`${c}11` }}>
+                              {r.tier}{r.degraded ? ' ↓' : ''}{r.denied ? ' ✕' : ''}
+                            </span>
+                            <div style={{ flex:1, minWidth:0 }}>
+                              <div style={{ display:'flex', justifyContent:'space-between', gap:8, fontSize:10 }}>
+                                <span style={{ color:'#e9d5ff', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                                  <b>{modelLabel(r.model)}</b>
+                                  <span style={{ color:'#7c5cc4' }}> · {taskLabel(r.taskType)}</span>
+                                </span>
+                                <span style={{ flexShrink:0, fontFamily:'monospace', color: r.denied ? '#f87171' : '#34d399' }}>
+                                  ${(r.denied ? 0 : (r.estCost || 0)).toFixed(4)}
+                                </span>
+                              </div>
+                              {r.reason && (
+                                <div style={{ fontSize:9, color:'#8b7bb8', lineHeight:1.45, marginTop:1 }}>{r.reason}</div>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })()}
 
               {/* Channel + per-image seal/intactness findings (refund verification) */}
               {m.role === 'bot' && m.verification && m.verification.channel && (
