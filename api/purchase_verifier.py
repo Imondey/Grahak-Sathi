@@ -121,9 +121,10 @@ async def verify_complaint(db_pool, user_id: str, mk_id: "Optional[str]", barcod
                 )
             if row and row["barcode"]:
                 txn_barcode = row["barcode"]
-                # Resolve the valid MK-IDs for that barcode from the product DB.
+                # Resolve the valid MK-IDs for that barcode from the lightweight
+                # product_catalog (no YOLO/EasyOCR import → keeps refunds fast).
                 try:
-                    from ai_core import MOCK_DB
+                    from product_catalog import MOCK_DB
                 except ImportError:
                     MOCK_DB = {}
                 product = MOCK_DB.get(txn_barcode)
