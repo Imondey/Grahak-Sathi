@@ -14,7 +14,8 @@
     "seed:image": "node seed-images.js",
     "test:injection": "node tools/test-injection.js",
     "test:capture": "node --test tools/test-capture-decision.js",
-    "test:intent": "node --test tools/test-intent-classifier.js"
+    "test:intent": "node --test tools/test-intent-classifier.js",
+    "test:billing": "node --test tools/test-assistant-billing.js"
   },
   "author": "Team Schrodinger",
   "license": "ISC",
