@@ -74,6 +74,25 @@ export default function CheckoutPage({ user, setUser }) {
             ? { ...v, ai_explanation: msg.explanation, ai_explanation_source: msg.source }
             : v)
         }
+        // Live capture-pipeline status pushed by the server at each Redis state
+        // transition (image_uploading → image_uploaded → yolo_processing →
+        // pending_manager | approved | blocked). Same typed-broadcast channel as
+        // TXN_RESULT above, so the till reflects the pipeline in real time.
+        if (msg.type === 'CAPTURE_STATE') {
+          setCaptureStatus({
+            txnRef:     msg.txn_ref,
+            state:      msg.status,
+            message:    msg.message || null,
+            confidence: msg.confidence ?? null,
+            reason:     msg.reason || null,
+          })
+          // A hard block also updates the main verdict panel.
+          if (msg.status === 'blocked') {
+            setVerdict(v => (v && (v.barcode === msg.barcode || v.status === 'blocked'))
+              ? { ...v, status: 'blocked', capture_block: true, message: msg.message || v.message }
+              : v)
+          }
+        }
       } catch {}
     }
     ws.onerror = () => {}
@@ -591,6 +610,34 @@ export default function CheckoutPage({ user, setUser }) {
           </div>
         </div>
       </div>
+
+      {/* Capture pipeline — live status pushed by the server at every Redis
+          state transition over the same WebSocket channel as the gate result. */}
+      {captureStatus && (() => {
+        const S = {
+          awaiting_capture: { label: 'Awaiting capture…',    color:'#a78bfa', spin:true },
+          capturing:        { label: 'Capturing frame…',     color:'#a78bfa', spin:true },
+          image_uploading:  { label: 'Uploading image…',     color:'#a78bfa', spin:true },
+          stored:           { label: 'Image uploaded',       color:'#7dd3fc' },
+          image_uploaded:   { label: 'Image uploaded',       color:'#7dd3fc' },
+          yolo_processing:  { label: 'YOLO checking item…',  color:'#7dd3fc', spin:true },
+          pending_manager:  { label: 'Waiting for manager…', color:'#fcd34d', spin:true },
+          approved:         { label: 'Match approved',       color:'#86efac' },
+          blocked:          { label: 'Blocked — mismatch',   color:'#fca5a5' },
+          skipped:          { label: 'Capture skipped',      color:'#9ca3af' },
+          error:            { label: 'Capture unavailable',  color:'#9ca3af' },
+        }[captureStatus.state] || { label: captureStatus.state, color:'#a78bfa' }
+        return (
+          <div style={{position:'fixed',bottom:70,right:22,zIndex:998,padding:'10px 14px',borderRadius:12,fontSize:12.5,fontWeight:600,display:'flex',alignItems:'center',gap:9,fontFamily:"'Sora',sans-serif",background:'rgba(10,8,20,.92)',border:`1px solid ${S.color}55`,color:S.color,maxWidth:320,lineHeight:1.35,boxShadow:'0 8px 24px rgba(0,0,0,.4)'}}>
+            <span style={{width:9,height:9,borderRadius:'50%',background:S.color,flexShrink:0,animation:S.spin?'blink 1s infinite':'none'}} />
+            <span>
+              {S.label}
+              {captureStatus.confidence != null && <span style={{opacity:.7,fontWeight:500}}> · {Math.round(captureStatus.confidence*100)}% match</span>}
+              {captureStatus.message && <div style={{opacity:.65,fontWeight:400,fontSize:11,marginTop:2}}>{captureStatus.message}</div>}
+            </span>
+          </div>
+        )
+      })()}
 
       {/* Toast */}
       <div style={{position:'fixed',bottom:22,right:22,zIndex:999,padding:'12px 18px',borderRadius:12,fontSize:13,fontWeight:500,display:'flex',alignItems:'center',gap:8,pointerEvents:'none',transform:toast.show?'translateY(0)':'translateY(80px)',opacity:toast.show?1:0,transition:'transform .4s cubic-bezier(.22,1,.36,1),opacity .4s',maxWidth:340,lineHeight:1.4,fontFamily:"'Sora',sans-serif",background:toast.type==='success'?'rgba(22,163,74,.14)':toast.type==='error'?'rgba(220,38,38,.14)':toast.type==='warn'?'rgba(217,119,6,.14)':'rgba(109,40,217,.14)',border:`1px solid ${toast.type==='success'?'rgba(134,239,172,.38)':toast.type==='error'?'rgba(252,165,165,.38)':toast.type==='warn'?'rgba(252,211,77,.38)':'rgba(167,139,250,.38)'}`,color:toast.type==='success'?'#86efac':toast.type==='error'?'#fca5a5':toast.type==='warn'?'#fcd34d':'#a78bfa',backdropFilter:'blur(14px)'}}>

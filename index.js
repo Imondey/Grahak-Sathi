@@ -1026,6 +1026,27 @@ if ((process.env.CAPTURE_HMAC_SECRET || '').length === 0 && process.env.NODE_ENV
 
 function captureStateKey(txnRef) { return `txn:capture:${txnRef}`; }
 
+// ── Capture pipeline state machine ────────────────────────────────────────────
+// Explicit lifecycle for a checkout capture, persisted as `status` on the
+// txn:capture:<txnRef> Redis state and pushed live to the checkout display at
+// every transition (see commitCaptureState/transitionCaptureState). The happy
+// path is a strict forward progression:
+//
+//   awaiting_capture → image_uploading → image_uploaded → yolo_processing
+//                        → pending_manager | approved | blocked
+//
+// Note: the detection step runs the LOCAL YOLO detector (FastAPI on-box), NOT a
+// remote LLM call — hence `yolo_processing` rather than a generic "llm_processing".
+const CAPTURE_STATE = Object.freeze({
+    AWAITING_CAPTURE: 'awaiting_capture',  // gate passed, HMAC token issued, waiting for the frame
+    IMAGE_UPLOADING:  'image_uploading',   // frame received, writing to local storage
+    IMAGE_UPLOADED:   'image_uploaded',    // frame written + sha256-verified + bound to the txn
+    YOLO_PROCESSING:  'yolo_processing',   // local YOLO capture-match running (vs. SKU reference image)
+    PENDING_MANAGER:  'pending_manager',   // borderline score → awaiting a manager tap
+    APPROVED:         'approved',          // cleared for checkout
+    BLOCKED:          'blocked',           // auto / manager-rejected / timeout block
+});
+
 // Sign a compact HMAC token: base64url(payload) + "." + base64url(HMAC-SHA256).
 function signCaptureToken(payload) {
     const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -1078,7 +1099,7 @@ async function issueCaptureAuthorization(shop, barcode, mkId, verifyResult) {
         barcode,
         mk_id:        mkId || null,
         gate:         'passed',
-        status:       'awaiting_capture',
+        status:       CAPTURE_STATE.AWAITING_CAPTURE,
         product_name: verifyResult.product_name || null,
         verified_at:  new Date(now).toISOString(),
         image:        null,
@@ -1105,6 +1126,49 @@ async function updateCaptureMatch(txnRef, match) {
     } catch (e) { console.warn('capture match state update failed (non-fatal):', e.message); }
 }
 
+// Persist an already-mutated capture-state object (preserving the remaining TTL)
+// and push its new lifecycle status to the shop's checkout display over the same
+// typed WebSocket channel used for the HMAC gate result (TXN_RESULT). Any decision
+// detail for the terminal states rides along in `extraBroadcast`. Fail-soft.
+async function commitCaptureState(state, extraBroadcast = {}) {
+    if (!state || !state.txn_ref) return;
+    state.status_at = new Date().toISOString();
+    try {
+        const key = captureStateKey(state.txn_ref);
+        const ttl = await redisClient.ttl(key);
+        await redisClient.set(key, JSON.stringify(state), { EX: ttl > 0 ? ttl : CAPTURE_STATE_TTL_S });
+    } catch (e) { console.warn('capture state persist failed (non-fatal):', e.message); }
+    if (state.shop_id != null) {
+        broadcastToShop(state.shop_id, {
+            type:    'CAPTURE_STATE',
+            txn_ref: state.txn_ref,
+            barcode: state.barcode,
+            status:  state.status,
+            ...extraBroadcast,
+        });
+    }
+}
+
+// Advance the capture lifecycle by txnRef: read the Redis state, set the new
+// status, persist + broadcast. If the state has expired (TTL elapsed) it still
+// pushes the status — using the provided shopId/barcode — so the checkout
+// display never gets stuck on a stale step.
+async function transitionCaptureState(txnRef, status, { shopId = null, barcode = null, ...extra } = {}) {
+    let state = null;
+    try { const raw = await redisClient.get(captureStateKey(txnRef)); if (raw) state = JSON.parse(raw); }
+    catch (e) { console.warn('capture state read failed (transition):', e.message); }
+
+    if (state) {
+        state.status = status;
+        await commitCaptureState(state, extra);
+        return state;
+    }
+    if (shopId != null) {
+        broadcastToShop(shopId, { type: 'CAPTURE_STATE', txn_ref: txnRef, barcode, status, ...extra });
+    }
+    return null;
+}
+
 // Compare the just-captured checkout image against the scanned SKU's reference
 // profile image (YOLO, in FastAPI) and record the 0–1 score. Run FIRE-AND-FORGET
 // off the checkout critical path so it can never add scan/checkout latency; the
@@ -1124,10 +1188,18 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
 
     if (!fs.existsSync(refAbs)) {
         await updateCaptureMatch(txnRef, { scored: false, reason: 'no_reference_image', at: new Date().toISOString() });
+        // Fail-open: nothing to compare against (store hasn't linked a reference
+        // image) → the item clears and /api/checkout/pay proceeds as before.
+        await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
+            shopId, barcode, scored: false, reason: 'no_reference_image',
+            message: 'No reference image on file — capture check skipped, item cleared.',
+        });
         return;
     }
 
     const checkoutAbs = (ref && ref.abs) || path.join(__dirname, ref.path);
+    // yolo_processing → the local YOLO capture-match comparison is starting.
+    await transitionCaptureState(txnRef, CAPTURE_STATE.YOLO_PROCESSING, { shopId, barcode });
     try {
         const r = await axios.post(`${FASTAPI_URL}/audit/capture-match`, {
             checkout_image_path:  checkoutAbs,
@@ -1168,9 +1240,21 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
         if (decision) {
             await applyCaptureDecision(shopId, txnRef, state, d, decision)
                 .catch(e => console.warn('capture decision dispatch failed (non-fatal):', e.message));
+        } else {
+            // Scored but no numeric confidence (no detection) → inconclusive.
+            // Fail-open to keep checkout moving; the audit trail keeps scored:false.
+            await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
+                shopId, barcode, scored: false, reason: d.reason || 'inconclusive',
+                message: 'Capture check inconclusive — item cleared.',
+            });
         }
     } catch (e) {
         await updateCaptureMatch(txnRef, { scored: false, reason: 'match_service_error: ' + e.message, at: new Date().toISOString() });
+        // Fail-open on a transient detector error so a legitimate checkout isn't stalled.
+        await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
+            shopId, barcode, scored: false, reason: 'match_service_error',
+            message: 'Capture check unavailable — item cleared.',
+        });
     }
 }
 
@@ -1326,8 +1410,8 @@ async function fireCaptureBlock(shopId, txnRef, barcode, product_name, record, a
         CAPTURE_REVIEW_REJECTED:  'Manager rejected the item after review — sale blocked.',
         CAPTURE_REVIEW_TIMEOUT:   `No manager response within ${CAPTURE_REVIEW_TIMEOUT_S}s — sale auto-blocked.`,
     };
-    broadcastToShop(shopId, {
-        type: 'CAPTURE_DECISION', decision: 'auto_block', action, txn_ref: txnRef, barcode,
+    await transitionCaptureState(txnRef, CAPTURE_STATE.BLOCKED, {
+        shopId, barcode, decision: 'auto_block', action,
         confidence: record.confidence, thresholds: record.thresholds,
         resolved_by: action === 'CAPTURE_MISMATCH_BLOCKED' ? 'auto'
                    : action === 'CAPTURE_REVIEW_REJECTED'  ? 'manager' : 'timeout',
@@ -1380,6 +1464,15 @@ async function onCaptureManagerReview(shopId, txnRef, barcode, product_name, rec
         timeout_seconds: CAPTURE_REVIEW_TIMEOUT_S,
         deadline_at:     pending.deadline_at,
         message:         `Borderline capture match — approve or reject within ${CAPTURE_REVIEW_TIMEOUT_S}s, otherwise it is auto-blocked.`,
+    });
+
+    // pending_manager → update the checkout display (customer-facing) that the
+    // sale is paused awaiting a manager decision. The rich CAPTURE_REVIEW_REQUEST
+    // above drives the manager tablet; this drives the till/display.
+    await transitionCaptureState(txnRef, CAPTURE_STATE.PENDING_MANAGER, {
+        shopId, barcode, confidence: record.confidence, thresholds: record.thresholds,
+        deadline_at: pending.deadline_at, timeout_seconds: CAPTURE_REVIEW_TIMEOUT_S,
+        message: 'Borderline match — waiting for manager approval.',
     });
 
     startReviewTimer(txnRef);
@@ -1461,10 +1554,9 @@ async function resolveCaptureReview(txnRef, outcome) {
             // Flip the pay-gate decision to approved so the held item now clears
             // the post-approval actions in /api/checkout/pay.
             await persistCaptureDecision(shopId, barcode, txnRef, record);
-            broadcastToShop(shopId, {
-                type: 'CAPTURE_DECISION', decision: 'auto_approve', action: 'CAPTURE_REVIEW_APPROVED',
-                resolved_by: 'manager', txn_ref: txnRef, barcode,
-                confidence: record.confidence, thresholds: record.thresholds,
+            await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
+                shopId, barcode, decision: 'auto_approve', action: 'CAPTURE_REVIEW_APPROVED',
+                resolved_by: 'manager', confidence: record.confidence, thresholds: record.thresholds,
                 message: 'Manager approved the item — cleared for checkout.',
             });
             console.log(`✅ Capture REVIEW-APPROVED ${txnRef} (barcode ${barcode}) by manager.`);
@@ -1496,8 +1588,8 @@ async function resolveCaptureReview(txnRef, outcome) {
 // AUTO-APPROVE → confident match. Clear the item so the post-approval actions in
 // /api/checkout/pay proceed normally. Notify the terminals it's cleared.
 async function onCaptureAutoApprove(shopId, txnRef, barcode, product_name, record) {
-    broadcastToShop(shopId, {
-        type: 'CAPTURE_DECISION', decision: 'auto_approve', txn_ref: txnRef, barcode,
+    await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
+        shopId, barcode, decision: 'auto_approve', resolved_by: 'auto',
         confidence: record.confidence, thresholds: record.thresholds,
         message: 'Captured item matches the scanned product — cleared for checkout.',
     });
@@ -1731,8 +1823,12 @@ app.post('/api/checkout/capture', isAuth, async (req, res) => {
     catch (e) { console.warn('capture state read failed:', e.message); }
     if (!state)
         return res.status(409).json({ ok: false, message: 'Capture window expired or transaction state not found.' });
-    if (state.status === 'captured')   // idempotent: don't overwrite an existing capture
+    if (state.image)   // idempotent: a frame is already bound to this txn
         return res.status(200).json({ ok: true, already: true, txn_ref: payload.txn_ref, image_ref: state.image });
+
+    // image_uploading → tell the display we've received the frame and are writing it.
+    state.status = CAPTURE_STATE.IMAGE_UPLOADING;
+    await commitCaptureState(state);
 
     // 3) LOCAL WRITE + CHECKSUM VERIFICATION (replaces the S3 multipart upload).
     let ref;
@@ -1740,12 +1836,10 @@ app.post('/api/checkout/capture', isAuth, async (req, res) => {
     catch (e) { return res.status(422).json({ ok: false, message: 'Capture write/verify failed: ' + e.message }); }
 
     // 4) Bind the transaction-scoped image reference to the Redis state.
-    state.status = 'captured';
+    //    image_uploaded → frame persisted + checksum-verified.
+    state.status = CAPTURE_STATE.IMAGE_UPLOADED;
     state.image  = { path: ref.path, checksum: ref.checksum, algo: 'sha256', bytes: ref.bytes, captured_at: new Date().toISOString() };
-    try {
-        const ttl = await redisClient.ttl(captureStateKey(payload.txn_ref));
-        await redisClient.set(captureStateKey(payload.txn_ref), JSON.stringify(state), { EX: ttl > 0 ? ttl : CAPTURE_STATE_TTL_S });
-    } catch (e) { console.warn('capture state update failed (non-fatal):', e.message); }
+    await commitCaptureState(state, { image_ref: state.image });
 
     console.log(`📸 Checkout capture stored — shop ${shop.id}, txn ${payload.txn_ref}, ${ref.bytes}B, sha256 ${ref.checksum.slice(0, 12)}…`);
     res.json({ ok: true, txn_ref: payload.txn_ref, image_ref: state.image });
