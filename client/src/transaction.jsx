@@ -509,6 +509,7 @@ export default function TransactionPage({ user, setUser }) {
   const [toast, setToast]         = useState({ msg:'', type:'', show:false })
   const [paid, setPaid]           = useState(false)
   const [receiptId, setReceiptId] = useState(null)
+  const [orderInfo, setOrderInfo] = useState(null)
   const [fraudCount, setFraudCount] = useState(0)
 
   useEffect(() => {
@@ -649,6 +650,16 @@ export default function TransactionPage({ user, setUser }) {
         showToast('Transaction complete — receipt generated', 'success')
       }
       if (data.transaction_id) setReceiptId(data.transaction_id)
+      // Capture the order status details for the post-checkout confirmation.
+      setOrderInfo({
+        transactionId: data.transaction_id || null,
+        time:  data.transaction_time || new Date().toISOString(),
+        channel: data.channel || 'offline',
+        total,
+        items: (Array.isArray(data.items) && data.items.length)
+          ? data.items
+          : verifiedItems.map(c => ({ product_name: c.productName, quantity: c.qty, price: c.price, barcode: c.barcode })),
+      })
       setScanning(false)
       setPaid(true)
 
@@ -694,6 +705,58 @@ export default function TransactionPage({ user, setUser }) {
             </div>
           </div>
         )}
+
+        {/* ── Order Status — date, time, items, transaction number ── */}
+        {orderInfo && (() => {
+          const d = new Date(orderInfo.time)
+          const dateStr = isNaN(d) ? '—' : d.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' })
+          const timeStr = isNaN(d) ? '—' : d.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', second:'2-digit' })
+          return (
+            <div style={{ width:'min(92vw, 460px)', marginTop:8, borderRadius:16, overflow:'hidden', border:'1px solid rgba(109,40,217,.28)', background:'rgba(8,3,18,.92)', backdropFilter:'blur(14px)', animation:'popIn .5s .3s cubic-bezier(.34,1.56,.64,1) both' }}>
+              <div style={{ padding:'12px 18px', borderBottom:'1px solid rgba(109,40,217,.18)', background:'rgba(0,0,0,.35)', display:'flex', alignItems:'center', gap:8 }}>
+                <span style={{ fontSize:15 }}>🧾</span>
+                <span style={{ fontFamily:"'Sora',sans-serif", fontSize:13, fontWeight:700, color:'#e9d5ff' }}>Order Status</span>
+                <span style={{ marginLeft:'auto', fontFamily:'monospace', fontSize:9, letterSpacing:'.8px', textTransform:'uppercase', padding:'3px 8px', borderRadius:6, color:'#86efac', background:'rgba(134,239,172,.1)', border:'1px solid rgba(134,239,172,.28)' }}>Confirmed</span>
+              </div>
+
+              {/* meta: date / time / txn number */}
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:1, background:'rgba(109,40,217,.12)' }}>
+                {[
+                  ['Date', dateStr],
+                  ['Time', timeStr],
+                  ['Transaction #', orderInfo.transactionId || '—'],
+                  ['Channel', (orderInfo.channel || 'offline') === 'online' ? 'Online' : 'In-store'],
+                ].map(([k,v],i)=>(
+                  <div key={i} style={{ background:'rgba(8,3,18,.92)', padding:'11px 16px' }}>
+                    <div style={{ fontFamily:'monospace', fontSize:9, letterSpacing:'1.2px', textTransform:'uppercase', color:'#4c1d95', marginBottom:4 }}>{k}</div>
+                    <div style={{ fontFamily:'monospace', fontSize:13, color:'#e9d5ff', fontWeight:600, wordBreak:'break-all' }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* itemised lines */}
+              <div style={{ padding:'6px 0' }}>
+                <div style={{ padding:'8px 18px 6px', fontFamily:'monospace', fontSize:9, letterSpacing:'1.2px', textTransform:'uppercase', color:'#4c1d95' }}>Items ({(orderInfo.items||[]).length})</div>
+                {(orderInfo.items || []).map((it, i) => (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:10, padding:'8px 18px', borderTop:'1px solid rgba(109,40,217,.08)' }}>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontFamily:"'Sora',sans-serif", fontSize:13, color:'#e9d5ff', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{it.product_name || 'Item'}</div>
+                      <div style={{ fontFamily:'monospace', fontSize:10, color:'#4c1d95', marginTop:2, letterSpacing:'.4px' }}>{it.barcode || '—'} · qty {it.quantity || 1}</div>
+                    </div>
+                    <div style={{ fontFamily:'monospace', fontSize:13, fontWeight:600, color:'#c4b5fd', flexShrink:0 }}>
+                      {it.price != null ? `₹${(it.price * (it.quantity || 1)).toFixed(2)}` : '—'}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'12px 18px', borderTop:'1px solid rgba(109,40,217,.18)', background:'rgba(0,0,0,.35)' }}>
+                <span style={{ fontFamily:'monospace', fontSize:10, letterSpacing:'1px', textTransform:'uppercase', color:'#a78bfa' }}>Total Paid</span>
+                <span style={{ fontFamily:"'Sora',sans-serif", fontSize:18, fontWeight:800, color:'#86efac' }}>₹{(orderInfo.total ?? total).toFixed(2)}</span>
+              </div>
+            </div>
+          )
+        })()}
         <div style={{ fontSize:11,color:'#a78bfa',fontFamily:'monospace',animation:'popIn .5s .25s cubic-bezier(.34,1.56,.64,1) both',letterSpacing:'.8px' }}>
           Session will auto-end in 5 seconds…
         </div>
