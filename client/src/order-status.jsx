@@ -84,7 +84,10 @@ export default function OrderStatusPage({ user, setUser }) {
             <span style={{ fontFamily:'monospace',fontSize:9,color:'#4c1d95',letterSpacing:'1.5px',textTransform:'uppercase',marginLeft:8 }}>/ Order Status</span>
           </div>
         </div>
-        <button onClick={() => navigate('/transaction')} style={{ padding:'6px 16px',borderRadius:20,fontSize:12,fontWeight:700,fontFamily:"'Sora',sans-serif",background:'linear-gradient(135deg,#7c3aed,#5b21b6)',color:'#fff',border:'none',cursor:'pointer',boxShadow:'0 0 16px rgba(124,58,237,.35)' }}>← Back to Cart</button>
+        <div style={{ display:'flex',gap:8 }}>
+          <button onClick={() => navigate('/purchases')} style={{ padding:'6px 14px',borderRadius:20,fontSize:12,fontWeight:600,fontFamily:"'Sora',sans-serif",background:'transparent',border:'1px solid rgba(109,40,217,.3)',color:'#6d28d9',cursor:'pointer' }}>🧾 All Purchases</button>
+          <button onClick={() => navigate('/transaction')} style={{ padding:'6px 16px',borderRadius:20,fontSize:12,fontWeight:700,fontFamily:"'Sora',sans-serif",background:'linear-gradient(135deg,#7c3aed,#5b21b6)',color:'#fff',border:'none',cursor:'pointer',boxShadow:'0 0 16px rgba(124,58,237,.35)' }}>← Back to Cart</button>
+        </div>
       </header>
 
       {/* Body */}

@@ -1810,6 +1810,53 @@ app.get('/api/checkout/order-status', isAuth, async (req, res) => {
     }
 });
 
+// GET /api/purchases — list past transactions (receipts) for the logged-in shop,
+// most recent first. Each entry summarises one receipt: transaction number, time,
+// channel, unit count and total (subtotal + 18% GST). Powers the Purchase History
+// page; clicking a row opens the Order Status page for that transaction id.
+//   ?limit=<n>   → cap the number of receipts returned (default 50, max 200)
+app.get('/api/purchases', isAuth, async (req, res) => {
+    const shop  = req.session.user;
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 50));
+
+    try {
+        const r = await db.query(
+            `SELECT transaction_id,
+                    MIN(created_at)                    AS created_at,
+                    MAX(purchase_channel)              AS channel,
+                    SUM(quantity)                      AS units,
+                    COUNT(*)                           AS line_count,
+                    SUM(COALESCE(price, 0) * quantity) AS subtotal
+               FROM transaction_items
+              WHERE shop_id = $1
+              GROUP BY transaction_id
+              ORDER BY MIN(created_at) DESC
+              LIMIT $2`,
+            [shop.id, limit]
+        );
+
+        const orders = r.rows.map(row => {
+            const subtotal = parseFloat(row.subtotal) || 0;
+            const gst      = +(subtotal * 0.18).toFixed(2);
+            return {
+                transaction_id:   row.transaction_id,
+                transaction_time: row.created_at,
+                channel:          row.channel || 'offline',
+                units:            parseInt(row.units) || 0,
+                line_count:       parseInt(row.line_count) || 0,
+                subtotal:         +subtotal.toFixed(2),
+                gst,
+                total:            +(subtotal + gst).toFixed(2),
+            };
+        });
+
+        return res.json({ found: orders.length > 0, count: orders.length, orders });
+    } catch (err) {
+        console.error('purchases list error:', err.message);
+        return res.status(500).json({ found: false, count: 0, orders: [], message: 'Could not load purchase history.' });
+    }
+});
+
 app.post('/api/checkout/verify', isAuth, async (req, res) => {
     const { barcode, mk_id } = req.body;
     if (!barcode || typeof barcode !== 'string' || barcode.trim().length < 4)

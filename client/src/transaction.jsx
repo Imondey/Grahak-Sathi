@@ -836,6 +836,7 @@ export default function TransactionPage({ user, setUser }) {
         </div>
         <div style={{ display:'flex',gap:8 }}>
           <button onClick={() => navigate('/home')} style={{ padding:'5px 14px',borderRadius:20,fontSize:11,fontFamily:"'Sora',sans-serif",background:'transparent',border:'1px solid rgba(109,40,217,.3)',color:'#6d28d9',cursor:'pointer',transition:'all .2s' }}>← Home</button>
+          <button onClick={() => navigate('/purchases')} style={{ padding:'5px 14px',borderRadius:20,fontSize:11,fontFamily:"'Sora',sans-serif",background:'transparent',border:'1px solid rgba(109,40,217,.3)',color:'#6d28d9',cursor:'pointer',transition:'all .2s' }}>🧾 History</button>
           <button onClick={logout} style={{ padding:'6px 16px',borderRadius:20,fontSize:12,fontWeight:700,fontFamily:"'Sora',sans-serif",background:'linear-gradient(135deg,#7c3aed,#5b21b6)',color:'#fff',border:'none',cursor:'pointer',boxShadow:'0 0 16px rgba(124,58,237,.35)' }}>Sign Out</button>
         </div>
       </header>
