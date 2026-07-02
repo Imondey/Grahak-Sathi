@@ -40,6 +40,7 @@ const injectionFilter         = require('./lib/injectionFilter');
 const knowledgeBase           = require('./lib/knowledgeBase');
 const { createBudgetEngine }  = require('./lib/budgetEngine');
 const { createAuditor }       = require('./lib/auditor');
+const { createCaptureThresholds } = require('./lib/captureThresholds');
 const { createCustomerAssistant } = require('./lib/customerAssistant');
 const { generateTransactionId } = require('./lib/txnId');
 
@@ -495,6 +496,12 @@ const db = new Client({
 db.connect()
     .then(() => console.log('✅ PostgreSQL connected'))
     .catch(err => { console.error('❌ DB failed:', err.message); process.exit(1); });
+
+// Per-store capture-match decision thresholds (>approve → auto-approve, ≤block →
+// auto-block, middle band → manager review). Resolved Redis-first and seeded
+// from the retailers table, so a store can tune its fraud sensitivity at runtime
+// without a code change. Declared after `db` so both dependencies are ready.
+const captureThresholds = createCaptureThresholds(redisClient, db);
 
 // ── Multer ────────────────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
@@ -1130,10 +1137,23 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
             barcode,
         }, { timeout: 20000 });
         const d = r.data || {};
+
+        // ── Threshold branching ───────────────────────────────────────────────
+        // Turn the raw 0–1 confidence into a decision using this store's tunable
+        // approve/block thresholds: >approve → auto-approve, ≤block → auto-block,
+        // the band in between → manager review. A null/inconclusive confidence
+        // (no detection) also lands in the review band (the safe middle).
+        let decision = null;
+        if (d.confidence != null && !isNaN(d.confidence)) {
+            const thresholds = await captureThresholds.get(shopId);
+            decision = captureThresholds.classify(d.confidence, thresholds).band;
+        }
+
         await updateCaptureMatch(txnRef, {
             scored:          d.confidence != null,
             confidence:      d.confidence ?? null,
             match:           d.match ?? null,
+            decision:        decision,
             checkout_label:  d.checkout_label ?? null,
             reference_label: d.reference_label ?? null,
             latency_ms:      d.latency_ms ?? null,
@@ -1142,10 +1162,171 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
             reason:          d.reason ?? null,
             at:              new Date().toISOString(),
         });
-        console.log(`🔎 Capture match ${txnRef}: confidence=${d.confidence}, match=${d.match} (${d.latency_ms}ms)`);
+        console.log(`🔎 Capture match ${txnRef}: confidence=${d.confidence}, match=${d.match}, decision=${decision || 'n/a'} (${d.latency_ms}ms)`);
+
+        // Route the decision into the existing post-approval / fraud-alert flows.
+        if (decision) {
+            await applyCaptureDecision(shopId, txnRef, state, d, decision)
+                .catch(e => console.warn('capture decision dispatch failed (non-fatal):', e.message));
+        }
     } catch (e) {
         await updateCaptureMatch(txnRef, { scored: false, reason: 'match_service_error: ' + e.message, at: new Date().toISOString() });
     }
+}
+
+// ── Capture-match decision plumbing ───────────────────────────────────────────
+// The three-way branch (auto-approve / manager review / auto-block) computed in
+// scoreCaptureMatch is recorded here so the downstream flows can act on it:
+//   • a barcode-indexed Redis key that /api/checkout/pay reads to gate the
+//     post-approval actions (stock decrement, ledger staging, low-stock check),
+//   • the txn-scoped capture state + transaction row (audit trail),
+//   • and, for auto-block, the existing fraud-alert flow.
+const CAPTURE_DECISION_TTL_S = parseInt(process.env.CAPTURE_DECISION_TTL_S) || 4 * 60 * 60; // 4h
+
+function captureDecisionKey(shopId, barcode) { return `capture:decision:${shopId}:${barcode}`; }
+
+// Read the recorded capture decision for a shop+barcode (null when none yet).
+async function readCaptureDecision(shopId, barcode) {
+    if (!barcode) return null;
+    try {
+        const raw = await redisClient.get(captureDecisionKey(shopId, barcode));
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+        console.warn('capture decision read failed (fail-open):', e.message);
+        return null;
+    }
+}
+
+// Look up the retailer row needed by the fraud-alert helpers (email + name).
+async function resolveShop(shopId) {
+    try {
+        const r = await db.query('SELECT id, shop_name, email FROM retailers WHERE id = $1', [shopId]);
+        return r.rows[0] || null;
+    } catch (e) { console.warn('resolveShop failed:', e.message); return null; }
+}
+
+// Persist the decision for the pay-time gate (Redis) + the audit trail (txn row).
+async function persistCaptureDecision(shopId, barcode, txnRef, record) {
+    if (barcode) {
+        try {
+            await redisClient.set(captureDecisionKey(shopId, barcode), JSON.stringify(record), { EX: CAPTURE_DECISION_TTL_S });
+        } catch (e) { console.warn('capture decision cache write failed (non-fatal):', e.message); }
+    }
+    try {
+        await db.query(
+            `UPDATE transactions
+                SET capture_match_decision = $1
+              WHERE id = (SELECT id FROM transactions
+                           WHERE shop_id = $2 AND barcode = $3
+                           ORDER BY scanned_at DESC LIMIT 1)`,
+            [record.band, shopId, barcode],
+        );
+    } catch (e) {
+        if (!persistCaptureDecision._warned) {
+            console.warn('capture decision persist skipped (run migration_capture_match_thresholds.sql):', e.message);
+            persistCaptureDecision._warned = true;
+        }
+    }
+}
+
+// Central dispatcher: persist the decision, then route it to the matching flow.
+async function applyCaptureDecision(shopId, txnRef, state, d, band) {
+    const thresholds = await captureThresholds.get(shopId);
+    const barcode      = state && state.barcode;
+    const product_name = (state && state.product_name) || d.checkout_label || d.reference_label || null;
+    const record = {
+        band,
+        confidence:      d.confidence ?? null,
+        thresholds,
+        checkout_label:  d.checkout_label ?? null,
+        reference_label: d.reference_label ?? null,
+        txn_ref:         txnRef,
+        at:              new Date().toISOString(),
+    };
+
+    await persistCaptureDecision(shopId, barcode, txnRef, record);
+
+    if (band === captureThresholds.BAND.AUTO_BLOCK) {
+        await onCaptureAutoBlock(shopId, txnRef, barcode, product_name, record);
+    } else if (band === captureThresholds.BAND.MANAGER_REVIEW) {
+        await onCaptureManagerReview(shopId, txnRef, barcode, product_name, record);
+    } else {
+        await onCaptureAutoApprove(shopId, txnRef, barcode, product_name, record);
+    }
+    return record;
+}
+
+// AUTO-BLOCK → the item photographed at checkout does not match the scanned SKU
+// (classic ticket-switch / item-substitution). Reuse the existing fraud-alert
+// flow: instant "why blocked?" broadcast, manager email, and a durable incident
+// log — identical to the barcode-fraud path in /api/checkout/verify.
+async function onCaptureAutoBlock(shopId, txnRef, barcode, product_name, record) {
+    const conf = record.confidence ?? 0;
+    // Frame the risk from the (low) match confidence so the existing fraud
+    // template renders a sensible percentage.
+    const riskScore = Math.round((1 - conf) * 100) / 100;
+    const flags = [
+        `capture-match ${(conf * 100).toFixed(0)}% ≤ block threshold ${(record.thresholds.autoBlock * 100).toFixed(0)}%`,
+    ];
+    if (record.checkout_label && record.reference_label && record.checkout_label !== record.reference_label) {
+        flags.push(`bagged item looks like '${record.checkout_label}' but the scanned SKU reference is '${record.reference_label}'`);
+    }
+
+    const shop = await resolveShop(shopId);
+    let explanation = null;
+    if (shop) {
+        explanation = await broadcastFraudExplanation(shop, {
+            barcode, product_name, risk_score: riskScore,
+            action: 'CAPTURE_MISMATCH_BLOCKED', intelligence_flags: flags,
+        }).catch(err => { console.warn('capture fraud explanation failed:', err.message); return null; });
+
+        sendFraudAlertEmail(shop, {
+            barcode, product_name, risk_score: riskScore,
+            timestamp: new Date().toISOString(), action: 'CAPTURE_MISMATCH_BLOCKED',
+            intelligence_flags: flags.join(' | '),
+            ai_explanation:     explanation ? explanation.text : null,
+            explanation_source: explanation ? explanation.source : null,
+        }).catch(err => console.error('capture fraud email failed:', err.message));
+    } else {
+        console.warn(`capture auto-block: shop ${shopId} not resolvable — manager email skipped (incident still logged).`);
+    }
+
+    try {
+        await db.query(
+            `INSERT INTO fraud_incidents (shop_id, barcode, product_name, risk_score, action, incident_at)
+             VALUES ($1,$2,$3,$4,$5,NOW())`,
+            [shopId, barcode, product_name || 'Unknown', riskScore, 'CAPTURE_MISMATCH_BLOCKED'],
+        );
+    } catch (e) { console.warn('capture fraud_incidents insert skipped:', e.message); }
+
+    broadcastToShop(shopId, {
+        type: 'CAPTURE_DECISION', decision: 'auto_block', txn_ref: txnRef, barcode,
+        confidence: record.confidence, thresholds: record.thresholds,
+        message: 'Captured item does not match the scanned product — sale blocked, manager notified.',
+    });
+    console.warn(`🚨 Capture AUTO-BLOCK ${txnRef} (barcode ${barcode}, confidence ${record.confidence}) — fraud alert fired.`);
+}
+
+// MANAGER REVIEW → borderline match. Don't auto-complete; surface it to the shop
+// terminals so a human decides. /api/checkout/pay holds these items.
+async function onCaptureManagerReview(shopId, txnRef, barcode, product_name, record) {
+    broadcastToShop(shopId, {
+        type: 'CAPTURE_DECISION', decision: 'manager_review', txn_ref: txnRef, barcode,
+        confidence: record.confidence, thresholds: record.thresholds,
+        message: 'Capture match is borderline — held for manager review before the sale can complete.',
+    });
+    console.log(`🕵️  Capture MANAGER-REVIEW ${txnRef} (barcode ${barcode}, confidence ${record.confidence}).`);
+}
+
+// AUTO-APPROVE → confident match. Clear the item so the post-approval actions in
+// /api/checkout/pay proceed normally. Notify the terminals it's cleared.
+async function onCaptureAutoApprove(shopId, txnRef, barcode, product_name, record) {
+    broadcastToShop(shopId, {
+        type: 'CAPTURE_DECISION', decision: 'auto_approve', txn_ref: txnRef, barcode,
+        confidence: record.confidence, thresholds: record.thresholds,
+        message: 'Captured item matches the scanned product — cleared for checkout.',
+    });
+    console.log(`✅ Capture AUTO-APPROVE ${txnRef} (barcode ${barcode}, confidence ${record.confidence}).`);
 }
 
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
@@ -1530,6 +1711,41 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     if (cleanItems.length === 0)
         return res.status(400).json({ ok: false, message: 'No valid items to pay for.' });
 
+    // ── Capture-match decision gate ──────────────────────────────────────────
+    // The post-approval actions below (stock decrement, ledger/return-eligible
+    // staging, low-stock check) are wired to the AUTO-APPROVE branch: only items
+    // the capture-match auto-approved — or legacy/unscored items with no decision
+    // yet — proceed. Items that were AUTO-BLOCKED (fraud) are refused, and
+    // borderline MANAGER-REVIEW items are held for a human. Fail-open: a missing
+    // decision (score still pending or no reference image) is treated as approved
+    // so a legitimate checkout is never stalled on the async score.
+    const captureBlocked = [];   // auto_block — refused
+    const captureReview  = [];   // manager_review — held for a manager
+    for (const it of cleanItems) {
+        const dec = await readCaptureDecision(shop.id, it.barcode);
+        if (!dec || !dec.band) continue;
+        if (dec.band === 'auto_block') {
+            captureBlocked.push({ barcode: it.barcode, product_name: it.product_name, confidence: dec.confidence });
+        } else if (dec.band === 'manager_review') {
+            captureReview.push({ barcode: it.barcode, product_name: it.product_name, confidence: dec.confidence });
+        }
+    }
+    const heldBarcodes  = new Set([...captureBlocked, ...captureReview].map(x => x.barcode));
+    const sellableItems = cleanItems.filter(i => !heldBarcodes.has(i.barcode));
+
+    // Nothing left to sell once the held items are removed → stop here and tell
+    // the terminal exactly what was blocked vs. what needs a manager.
+    if (sellableItems.length === 0) {
+        return res.status(409).json({
+            ok: false,
+            message: captureBlocked.length > 0
+                ? 'Checkout blocked — the captured item(s) do not match the scanned product.'
+                : 'Checkout held — the captured item(s) need manager review before completing.',
+            captureBlocked,
+            captureReview,
+        });
+    }
+
     const lowStock      = [];     // products whose new quantity < threshold
     const insufficient  = [];     // requested qty exceeded available
     const notFound      = [];     // barcode not in this shop's inventory
@@ -1538,7 +1754,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     try {
         await db.query('BEGIN');
 
-        for (const { barcode, qty } of cleanItems) {
+        for (const { barcode, qty } of sellableItems) {
             // Atomic decrement: only succeed if enough stock is available.
             const r = await db.query(
                 `UPDATE products
@@ -1580,7 +1796,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         }
 
         await db.query('COMMIT');
-        console.log(`💰 Sale committed for shop ${shop.id}: ${cleanItems.length} item(s)`);
+        console.log(`💰 Sale committed for shop ${shop.id}: ${sellableItems.length} item(s)`);
     } catch (err) {
         try { await db.query('ROLLBACK'); } catch {}
         console.error('❌ Pay transaction failed:', err.message);
@@ -1597,7 +1813,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     const customerId = shop.session_token || (shop.role === 'customer' ? `SHOP_${shop.id}` : null);
     let imagesSaved = 0;
     let itemsSaved  = 0;
-    for (const it of cleanItems) {
+    for (const it of sellableItems) {
         const info = soldInfo[it.barcode] || {};
         const productName = info.product_name || it.product_name || null;
         const price       = info.price ?? it.price ?? null;
@@ -1630,7 +1846,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     const returnEligibleUntil = new Date(Date.now() + returnWindowDays * 86400000).toISOString();
     const transactionTime     = new Date().toISOString();
     // Itemised order lines for the customer's post-checkout order status/receipt.
-    const orderItems = cleanItems.map(it => {
+    const orderItems = sellableItems.map(it => {
         const info = soldInfo[it.barcode] || {};
         return {
             barcode:      it.barcode,
@@ -1656,7 +1872,7 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
     // ── Auto-end customer session after successful payment ─────────────────
     // If caller is a customer, schedule session expiry in 5 seconds.
     // This gives the frontend time to show the success screen before logout.
-    const paymentTotal = cleanItems.reduce((sum, item) => sum + item.qty, 0);
+    const paymentTotal = sellableItems.reduce((sum, item) => sum + item.qty, 0);
 
     if (shop.role === 'customer' && shop.session_token) {
         const autoEndToken = shop.session_token;
@@ -1694,6 +1910,10 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         returnEligibleUntil,
         checkoutImagesStored: imagesSaved,
         channel,
+        // Items excluded from this sale by the capture-match decision gate, so the
+        // terminal can surface what was blocked (fraud) vs. held for a manager.
+        captureBlocked,
+        captureReview,
         sessionAutoEnd: shop.role === 'customer' ? 5 : null,
     });
 });
@@ -2293,6 +2513,46 @@ app.post('/api/admin/monthly-budget', isAdmin, async (req, res) => {
     const snap = await budgetEngine.setStoreLimit(shopId, rounded);
     console.log(`💵 Monthly AI budget for shop ${shopId} set to $${rounded}`);
     res.json({ ...snap, updated: true });
+});
+
+// GET /api/admin/capture-thresholds — this store's capture-match decision bands.
+// Returns the tunable auto-approve / auto-block thresholds (and the global
+// defaults) so a manager can see and adjust their fraud sensitivity.
+app.get('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    const current = await captureThresholds.get(shopId);
+    res.json({
+        shopId,
+        autoApprove: current.autoApprove,
+        autoBlock:   current.autoBlock,
+        defaults:    captureThresholds.DEFAULTS,
+        bands: {
+            auto_approve:   `confidence > ${current.autoApprove}`,
+            manager_review: `${current.autoBlock} < confidence <= ${current.autoApprove}`,
+            auto_block:     `confidence <= ${current.autoBlock}`,
+        },
+    });
+});
+
+// POST /api/admin/capture-thresholds — tune this store's decision bands.
+// Body: { auto_approve: number, auto_block: number } (0–1). Persisted to the
+// retailers table AND Redis so the live gate picks it up immediately. Values are
+// normalized/validated (0 <= block < approve <= 1) before they are stored.
+app.post('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
+    const shopId      = req.session.user.id;
+    const autoApprove = parseFloat(req.body?.auto_approve);
+    const autoBlock   = parseFloat(req.body?.auto_block);
+
+    if (isNaN(autoApprove) || isNaN(autoBlock))
+        return res.status(400).json({ message: 'auto_approve and auto_block must both be numbers between 0 and 1.' });
+    if (autoApprove < 0 || autoApprove > 1 || autoBlock < 0 || autoBlock > 1)
+        return res.status(400).json({ message: 'auto_approve and auto_block must be between 0 and 1.' });
+    if (autoBlock >= autoApprove)
+        return res.status(400).json({ message: 'auto_block must be strictly less than auto_approve.' });
+
+    const resolved = await captureThresholds.set(shopId, { autoApprove, autoBlock });
+    console.log(`🎚️  Capture-match thresholds for shop ${shopId} set to approve>${resolved.autoApprove}, block<=${resolved.autoBlock}`);
+    res.json({ shopId, ...resolved, updated: true });
 });
 
 
