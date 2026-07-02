@@ -13,6 +13,8 @@ export default function AdminDashboard({ user, setUser }) {
   const [toast, setToast]             = useState({ msg: '', type: '', show: false })
   const [copiedToken, setCopiedToken] = useState(null)
   const [usage, setUsage]             = useState(null)
+  const [budgetInput, setBudgetInput] = useState('')
+  const [savingBudget, setSavingBudget] = useState(false)
 
   useEffect(() => {
     const link = document.createElement('link')
@@ -30,6 +32,32 @@ export default function AdminDashboard({ user, setUser }) {
       const res = await fetch('/api/admin/usage-transparency', { credentials: 'include' })
       if (res.ok) setUsage(await res.json())
     } catch {}
+  }
+
+  async function saveBudget() {
+    const val = parseFloat(budgetInput)
+    if (isNaN(val) || val < 0) { showToast('Enter a valid monthly budget (e.g. 15).', 'error'); return }
+    setSavingBudget(true)
+    try {
+      const res = await fetch('/api/admin/monthly-budget', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ limit_usd: val }),
+      })
+      const data = await res.json()
+      if (res.ok) {
+        showToast(`Monthly AI budget set to $${(data.limit||val).toFixed(2)}`, 'success')
+        setBudgetInput('')
+        fetchUsage()
+      } else {
+        showToast(data.message || 'Failed to update budget.', 'error')
+      }
+    } catch {
+      showToast('Connection error.', 'error')
+    } finally {
+      setSavingBudget(false)
+    }
   }
 
   function showToast(msg, type = 'success') {
@@ -230,7 +258,45 @@ export default function AdminDashboard({ user, setUser }) {
                 })}
               </div>
 
-              {/* recent injection attempts */}
+              {/* ── Per-store MONTHLY LLM budget (separate from the $2 session demo budget) ── */}
+              {usage.monthlyBudget && (() => {
+                const mb = usage.monthlyBudget
+                const pct = Math.min(100, mb.limit > 0 ? (mb.spent / mb.limit) * 100 : 0)
+                const barColor = mb.phase === 'EXHAUSTED' ? '#f87171'
+                               : mb.phase === 'CRITICAL' ? '#fb923c'
+                               : mb.phase === 'WARNING' ? '#fbbf24' : '#34d399'
+                return (
+                  <div style={{ marginTop:18, borderTop:'1px solid rgba(109,40,217,.12)', paddingTop:16 }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10, flexWrap:'wrap' }}>
+                      <span style={{ fontSize:10, color:'#64748b', fontFamily:'monospace', letterSpacing:'1px' }}>MONTHLY AI BUDGET · {mb.month}</span>
+                      <span style={{ fontSize:9, padding:'2px 7px', borderRadius:6, color:barColor, background:`${barColor}18`, border:`1px solid ${barColor}44`, fontFamily:'monospace', letterSpacing:'.5px' }}>{mb.phase}</span>
+                      <span style={{ fontSize:9, color:'#4c1d95', fontFamily:'monospace' }}>fraud detection is always exempt</span>
+                      <div style={{ flex:1 }} />
+                      <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                        <span style={{ fontSize:11, color:'#64748b', fontFamily:'monospace' }}>$</span>
+                        <input
+                          type="number" min="0" step="1"
+                          value={budgetInput}
+                          onChange={e => setBudgetInput(e.target.value)}
+                          placeholder={mb.limit != null ? mb.limit.toFixed(0) : '15'}
+                          style={{ width:70, padding:'6px 8px', borderRadius:8, border:'1px solid rgba(109,40,217,.3)', background:'rgba(0,0,0,.35)', color:'#e9d5ff', fontFamily:'monospace', fontSize:12, outline:'none' }}
+                        />
+                        <button onClick={saveBudget} disabled={savingBudget}
+                          style={{ padding:'6px 12px', borderRadius:8, border:'none', cursor:savingBudget?'not-allowed':'pointer', fontSize:11, fontWeight:700, fontFamily:"'Sora',sans-serif", background:'linear-gradient(135deg,#7c3aed,#5b21b6)', color:'#fff', opacity:savingBudget?.5:1 }}>
+                          {savingBudget ? 'Saving…' : 'Set'}
+                        </button>
+                      </div>
+                    </div>
+                    <div style={{ height:20, borderRadius:6, background:'rgba(124,58,237,.08)', overflow:'hidden', position:'relative' }}>
+                      <div style={{ height:'100%', width:`${pct}%`, background:`${barColor}55`, borderRight:`2px solid ${barColor}`, transition:'width .5s ease' }} />
+                      <div style={{ position:'absolute', inset:0, display:'flex', alignItems:'center', justifyContent:'space-between', padding:'0 12px', fontFamily:'monospace', fontSize:11 }}>
+                        <span style={{ color:'#e9d5ff', fontWeight:700 }}>${(mb.spent||0).toFixed(3)} spent</span>
+                        <span style={{ color:'#94a3b8' }}>${(mb.remaining||0).toFixed(2)} left of ${(mb.limit||0).toFixed(2)}</span>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
               {(usage.recentInjections||[]).length > 0 && (
                 <div style={{ marginTop:16, borderTop:'1px solid rgba(109,40,217,.12)', paddingTop:14 }}>
                   <div style={{ fontSize:10, color:'#fb923c', fontFamily:'monospace', letterSpacing:'1px', marginBottom:8 }}>🛡️ RECENT INJECTION ATTEMPTS</div>

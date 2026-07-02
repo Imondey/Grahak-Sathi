@@ -65,6 +65,11 @@ export default function CheckoutPage({ user, setUser }) {
       try {
         const msg = JSON.parse(e.data)
         if (msg.type === 'TXN_RESULT') setVerdict(msg.result)
+        if (msg.type === 'FRAUD_EXPLANATION') {
+          setVerdict(v => (v && (v.barcode === msg.barcode || v.status === 'blocked'))
+            ? { ...v, ai_explanation: msg.explanation, ai_explanation_source: msg.source }
+            : v)
+        }
       } catch {}
     }
     ws.onerror = () => {}
@@ -365,6 +370,29 @@ export default function CheckoutPage({ user, setUser }) {
                       </div>
                     ))}
                   </div>
+
+                  {/* Fraud explanation — "why was this blocked?" (Feature: Fraud Alert Explainer) */}
+                  {verdict.status==='blocked' && (
+                    <div style={{margin:'16px 22px 20px',padding:'14px 16px',borderRadius:12,background:'rgba(252,165,165,.05)',border:'1px solid rgba(252,165,165,.2)'}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,fontFamily:'monospace',fontSize:10,fontWeight:700,letterSpacing:'1.2px',textTransform:'uppercase',color:'#fca5a5'}}>
+                        <span style={{fontSize:13}}>{verdict.ai_explanation_source==='ai'?'🤖':'🔍'}</span>
+                        Why was this blocked?
+                        {verdict.ai_explanation && (
+                          <span style={{marginLeft:'auto',padding:'2px 8px',borderRadius:6,fontSize:9,letterSpacing:'.5px',background:verdict.ai_explanation_source==='ai'?'rgba(167,139,250,.12)':'rgba(252,211,77,.1)',border:`1px solid ${verdict.ai_explanation_source==='ai'?'rgba(167,139,250,.3)':'rgba(252,211,77,.3)'}`,color:verdict.ai_explanation_source==='ai'?'#a78bfa':'#fcd34d'}}>
+                            {verdict.ai_explanation_source==='ai'?'AI · OTARI':'RULE-BASED'}
+                          </span>
+                        )}
+                      </div>
+                      {verdict.ai_explanation
+                        ? <p style={{fontSize:13,lineHeight:1.7,color:'#e9d5ff',margin:0,fontFamily:"'Sora',sans-serif"}}>{verdict.ai_explanation}</p>
+                        : (
+                          <div style={{display:'flex',alignItems:'center',gap:8,fontFamily:'monospace',fontSize:11,color:'#fcd34d'}}>
+                            <span style={{width:12,height:12,border:'2px solid rgba(252,211,77,.25)',borderTopColor:'#fcd34d',borderRadius:'50%',animation:'spin .7s linear infinite',display:'inline-block'}} />
+                            Generating explanation…
+                          </div>
+                        )}
+                    </div>
+                  )}
                 </>
               )}
             </div>

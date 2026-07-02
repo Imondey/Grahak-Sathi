@@ -69,6 +69,49 @@ if (otari.enabled) {
 }
 
 /**
+ * Build a plain-English fraud explanation from the RAW signals alone — no LLM.
+ * This is deterministic, instant, and always available (works even when the
+ * Otari gateway is down), so the cashier terminal can show a "why was this
+ * blocked?" answer the moment a scan is rejected. When the gateway IS enabled
+ * we later replace this with a richer LLM narrative (see broadcastFraudExplanation).
+ */
+function composeFraudExplanation({ barcode, product_name, risk_score, action, intelligence_flags }) {
+    const pct = Math.round((risk_score || 0) * 100);
+    const flags = Array.isArray(intelligence_flags)
+        ? intelligence_flags.filter(Boolean)
+        : String(intelligence_flags || '').split('|').map(s => s.trim()).filter(Boolean);
+
+    // Translate the internal signal codes into human sentences.
+    const reasons = [];
+    for (const f of flags) {
+        if (/HIGH_FREQUENCY|ELEVATED_FREQUENCY/i.test(f)) {
+            const n = (f.match(/(\d+)\s*scans?/i) || [])[1];
+            reasons.push(`this barcode has been scanned ${n ? n + ' times' : 'unusually often'} in the last hour, which suggests a barcode being reused across items`);
+        } else if (/NEW_BARCODE/i.test(f)) {
+            reasons.push(`this barcode has never been seen at your store before, so it could be a freshly-printed or swapped label`);
+        } else if (/FRESH_LABEL/i.test(f)) {
+            const m = (f.match(/(\d+)\s*min/i) || [])[1];
+            reasons.push(`the barcode first appeared only ${m ? m + ' minutes' : 'moments'} ago — a common sign of a stuck-on counterfeit label`);
+        } else {
+            reasons.push(f.replace(/_/g, ' ').toLowerCase());
+        }
+    }
+
+    const product = product_name ? `"${product_name}"` : 'this item';
+    let why;
+    if (reasons.length === 0) {
+        why = `the fraud model scored ${product} at ${pct}% risk, above the safe threshold`;
+    } else if (reasons.length === 1) {
+        why = `${reasons[0]} (overall risk ${pct}%)`;
+    } else {
+        why = `${reasons.slice(0, -1).join('; ')}; and ${reasons[reasons.length - 1]} (overall risk ${pct}%)`;
+    }
+
+    return `Barcode ${barcode} on ${product} was ${action === 'TRANSACTION_BLOCKED' ? 'blocked' : 'flagged'} because ${why}. ` +
+           `Recommended action: verify the physical product against its label and packaging before overriding, and set the item aside if the label looks tampered with.`;
+}
+
+/**
  * Generate a human-readable fraud alert explanation via the Otari gateway.
  * Returns a plain-English summary the admin can quickly understand.
  */
@@ -96,6 +139,41 @@ Write in simple language. Explain WHAT happened, WHY it's suspicious, and WHAT t
         console.warn('Otari fraud explanation error (non-fatal):', err.message);
         return null;
     }
+}
+
+/**
+ * Push a "why was this blocked?" explanation to the shop's live checkout UI.
+ *   1. Immediately broadcasts a deterministic, rule-derived explanation so the
+ *      cashier sees an answer the instant the scan is rejected.
+ *   2. If the Otari gateway is enabled, asynchronously generates a richer LLM
+ *      narrative and broadcasts it as a replacement (source: 'ai').
+ * Returns the final explanation text (LLM if available, else deterministic) so
+ * the caller can reuse it for the fraud email without generating it twice.
+ */
+async function broadcastFraudExplanation(shop, signals) {
+    const deterministic = composeFraudExplanation(signals);
+    // Instant push — rule-based, always available.
+    broadcastToShop(shop.id, {
+        type: 'FRAUD_EXPLANATION',
+        barcode: signals.barcode,
+        explanation: deterministic,
+        source: 'rule',
+    });
+
+    if (!otari.enabled) return { text: deterministic, source: 'rule' };
+
+    // Upgrade to an LLM narrative when the gateway is configured.
+    const ai = await generateFraudExplanation({ ...signals, shop_name: shop.shop_name });
+    if (ai) {
+        broadcastToShop(shop.id, {
+            type: 'FRAUD_EXPLANATION',
+            barcode: signals.barcode,
+            explanation: ai,
+            source: 'ai',
+        });
+        return { text: ai, source: 'ai' };
+    }
+    return { text: deterministic, source: 'rule' };
 }
 
 // ── Redis Client ──────────────────────────────────────────────────────────────
@@ -1053,6 +1131,26 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
             flagData.last_seen = new Date().toISOString();
             await redisClient.set(fraudKey, JSON.stringify(flagData), { EX: 86400 }).catch(() => {});
 
+            // Generate the plain-English "why blocked?" explanation ONCE, then
+            // reuse it for both the live UI (WebSocket) and the fraud email.
+            // broadcastFraudExplanation pushes an instant rule-based answer and,
+            // if Otari is configured, upgrades it to an LLM narrative.
+            const explanation = await broadcastFraudExplanation(shop, {
+                barcode:      barcode.trim(),
+                product_name: verifyResult.product_name,
+                risk_score:   verifyResult.fraud_risk,
+                action:       'TRANSACTION_BLOCKED',
+                intelligence_flags: intelligenceFlags,
+            }).catch(err => { console.warn('Fraud explanation broadcast failed:', err.message); return null; });
+
+            // Embed on the result so the TXN_RESULT broadcast + HTTP response
+            // (both sent after this block) carry the explanation too, instead of
+            // racing/overwriting the FRAUD_EXPLANATION message on the client.
+            if (explanation) {
+                verifyResult.ai_explanation        = explanation.text;
+                verifyResult.ai_explanation_source = explanation.source;
+            }
+
             sendFraudAlertEmail(shop, {
                 barcode:      barcode.trim(),
                 product_name: verifyResult.product_name,
@@ -1060,6 +1158,8 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
                 timestamp:    new Date().toISOString(),
                 action:       'TRANSACTION_BLOCKED',
                 intelligence_flags: intelligenceFlags.join(' | '),
+                ai_explanation:      explanation ? explanation.text : null,
+                explanation_source:  explanation ? explanation.source : null,
             }).catch(console.error);
 
             if (flagData.count >= 3 && !flagData.escalated) {
@@ -1070,7 +1170,7 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
             }
         }
 
-        broadcastToShop(shop.id, { type: 'TXN_RESULT', barcode: barcode.trim(), result: verifyResult });
+        broadcastToShop(shop.id, { type: 'TXN_RESULT', barcode: barcode.trim(), result: { ...verifyResult, barcode: barcode.trim() } });
         return res.status(200).json(verifyResult);
 
     } finally {
@@ -1288,6 +1388,18 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         }
     }
     const returnEligibleUntil = new Date(Date.now() + returnWindowDays * 86400000).toISOString();
+    const transactionTime     = new Date().toISOString();
+    // Itemised order lines for the customer's post-checkout order status/receipt.
+    const orderItems = cleanItems.map(it => {
+        const info = soldInfo[it.barcode] || {};
+        return {
+            barcode:      it.barcode,
+            product_name: info.product_name || it.product_name || 'Item',
+            quantity:     it.qty,
+            price:        info.price ?? it.price ?? null,
+            mk_id:        it.mk_id || null,
+        };
+    });
     console.log(`🧾 Transaction ${transactionId} issued (channel=${channel}, ${itemsSaved} item(s) ledgered, ${imagesSaved} checkout image(s) stored).`);
 
     // Dedup against Redis: if we've already emailed about this barcode within
@@ -1337,6 +1449,8 @@ app.post('/api/checkout/pay', isAuth, async (req, res) => {
         ok: true,
         lowStock,
         transaction_id: transactionId,
+        transaction_time: transactionTime,
+        items: orderItems,
         returnEligibleUntil,
         checkoutImagesStored: imagesSaved,
         channel,
@@ -1582,7 +1696,19 @@ app.get('/api/admin/usage-transparency', isAdmin, async (req, res) => {
         claims: { approved: 0, denied: 0, review: 0 },
         recentInjections: [],
         recentClaims: [],
+        monthlyBudget: null,
     };
+    // Per-store MONTHLY budget snapshot (seed the Redis limit from the DB first so
+    // the configured value survives a Redis flush / restart).
+    try {
+        const cfg = await db.query('SELECT monthly_ai_budget_usd FROM retailers WHERE id = $1', [shopId]);
+        if (cfg.rows.length > 0 && cfg.rows[0].monthly_ai_budget_usd != null) {
+            await budgetEngine.setStoreLimit(shopId, cfg.rows[0].monthly_ai_budget_usd);
+        }
+    } catch (err) {
+        if (!app._budgetSeedWarned) { console.warn('monthly budget seed skipped (run migration_store_monthly_budget.sql):', err.message); app._budgetSeedWarned = true; }
+    }
+    out.monthlyBudget = await budgetEngine.storeSnapshot(shopId);
     try {
         const tierRows = await db.query(
             `SELECT tier, COUNT(*)::int AS calls, COALESCE(SUM(cost_usd),0)::float AS spend,
@@ -1633,6 +1759,43 @@ app.get('/api/admin/usage-transparency', isAdmin, async (req, res) => {
     res.json(out);
 });
 
+// GET /api/admin/monthly-budget — current per-store monthly LLM budget + spend.
+app.get('/api/admin/monthly-budget', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    try {
+        const cfg = await db.query('SELECT monthly_ai_budget_usd FROM retailers WHERE id = $1', [shopId]);
+        if (cfg.rows.length > 0 && cfg.rows[0].monthly_ai_budget_usd != null) {
+            await budgetEngine.setStoreLimit(shopId, cfg.rows[0].monthly_ai_budget_usd);
+        }
+    } catch (err) {
+        if (!app._budgetGetWarned) { console.warn('monthly budget read skipped (run migration_store_monthly_budget.sql):', err.message); app._budgetGetWarned = true; }
+    }
+    const snap = await budgetEngine.storeSnapshot(shopId);
+    res.json({ ...snap, default: aiConfig.STORE_MONTHLY_BUDGET_USD });
+});
+
+// POST /api/admin/monthly-budget — set the per-store monthly LLM budget.
+// Body: { limit_usd: number }. Persists to the retailers table AND Redis so the
+// live counter picks it up immediately. Fraud detection is unaffected either way.
+app.post('/api/admin/monthly-budget', isAdmin, async (req, res) => {
+    const shopId = req.session.user.id;
+    const limit  = parseFloat(req.body?.limit_usd);
+    if (isNaN(limit) || limit < 0 || limit > 100000)
+        return res.status(400).json({ message: 'limit_usd must be a number between 0 and 100000.' });
+
+    const rounded = Math.round(limit * 100) / 100;
+    try {
+        await db.query('UPDATE retailers SET monthly_ai_budget_usd = $1 WHERE id = $2', [rounded, shopId]);
+    } catch (err) {
+        // Column missing (pre-migration) — still apply to the live Redis limit.
+        if (!app._budgetSetWarned) { console.warn('monthly budget persist skipped (run migration_store_monthly_budget.sql):', err.message); app._budgetSetWarned = true; }
+    }
+    const snap = await budgetEngine.setStoreLimit(shopId, rounded);
+    console.log(`💵 Monthly AI budget for shop ${shopId} set to $${rounded}`);
+    res.json({ ...snap, updated: true });
+});
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CATCH-ALL — React Router (MUST be last, after all /api/* routes)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1672,18 +1835,28 @@ async function sendWelcomeEmail(email, ownerName, shopName) {
     console.log(`📧 Welcome email → ${email}`);
 }
 
-async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, timestamp, action, intelligence_flags }) {
-    // Generate AI explanation via the Otari LLM gateway
-    const aiExplanation = await generateFraudExplanation({
-        barcode, product_name, risk_score, action,
-        intelligence_flags: intelligence_flags || '',
-        shop_name: shop.shop_name,
-    });
+async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, timestamp, action, intelligence_flags, ai_explanation, explanation_source }) {
+    // Reuse a pre-generated explanation when the caller already produced one
+    // (real-time checkout path), otherwise generate on demand via Otari.
+    let aiExplanation = ai_explanation || null;
+    let source        = explanation_source || (ai_explanation ? 'ai' : null);
+    if (!aiExplanation) {
+        aiExplanation = await generateFraudExplanation({
+            barcode, product_name, risk_score, action,
+            intelligence_flags: intelligence_flags || '',
+            shop_name: shop.shop_name,
+        });
+        source = aiExplanation ? 'ai' : null;
+    }
+
+    // Label the panel honestly: LLM-written narratives get the AI tag, the
+    // deterministic rule-based fallback is labelled as automated analysis.
+    const analysisLabel = source === 'ai' ? '🤖 AI ANALYSIS (Otari)' : '🔍 AUTOMATED FRAUD ANALYSIS';
 
     const aiSection = aiExplanation ? `
           <tr><td colspan="2" style="padding:16px;border-top:2px solid #4a0d0f">
             <div style="background:#1a0a0a;border:1px solid #3d0d0f;border-radius:10px;padding:16px">
-              <div style="font-size:11px;color:#ff8888;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">🤖 AI ANALYSIS (Llama)</div>
+              <div style="font-size:11px;color:#ff8888;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:8px">${analysisLabel}</div>
               <p style="color:#e2e8f0;font-size:13px;line-height:1.7;margin:0">${aiExplanation}</p>
             </div>
           </td></tr>` : '';
@@ -1712,7 +1885,7 @@ async function sendFraudAlertEmail(shop, { barcode, product_name, risk_score, ti
           </table>
         </div>`,
     });
-    console.log(`🚨 SendGrid fraud alert → ${shop.email}${aiExplanation ? ' (with Llama AI analysis)' : ''}`);
+    console.log(`🚨 SendGrid fraud alert → ${shop.email}${aiExplanation ? ` (with ${source === 'ai' ? 'Otari AI' : 'automated'} analysis)` : ''}`);
 }
 
 async function sendLowStockEmail(shop, lowStockItems) {
