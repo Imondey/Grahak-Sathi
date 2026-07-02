@@ -194,6 +194,55 @@ Image-based verification (home page) runs YOLO (class) + EasyOCR (label) + Rapid
 inventory; a trust score below ~65% triggers a BLOCK. `fraud_type` ∈ `LABEL_SWAP`,
 `PARTIAL_MISMATCH`, `LOW_CONFIDENCE`, `BARCODE_NOT_FOUND`, `null`.
 
+### Post-Gate Checkout Capture & YOLOv10 Capture-Match (local-only storage)
+
+Once a scan clears the gate, an overhead frame of the bagged item is captured and
+scored against the SKU's **reference profile image** with the local **YOLOv10**
+detector — catching ticket-switching / item-substitution (right barcode, wrong
+item in the bag).
+
+- **Local-only image storage (no S3 / cloud object store).** The frame is written
+  to the **local filesystem** at `store-data/checkout-captures/<shop_id>/<txn_ref>.jpg`
+  (path configurable via `CHECKOUT_CAPTURES_DIR`) and verified with a **sha256
+  checksum** (write → read-back → re-hash). Only a transaction-scoped **reference**
+  — `{ path, checksum, algo, bytes, captured_at }` — is bound to the capture state
+  in **Redis**; the image bytes never leave the box. This replaces the earlier
+  notional S3 multipart upload: everything is on-prem, so there is no cloud
+  dependency, egress, or presigned-URL step on the checkout critical path.
+- **Capture only after gate-pass.** The capture endpoint requires a short-lived
+  **HMAC-signed token** issued *only* on approval, so no image is ever written for
+  a blocked/duplicate/invalid scan.
+- **YOLOv10 capture-match → 0–1 confidence**, run **fire-and-forget** off the
+  checkout critical path (so it never adds scan latency), then turned into a
+  three-way decision using **per-store thresholds** (`retailers` table, defaults
+  0.90 / 0.60; tune via `POST /api/admin/capture-thresholds`):
+
+  | Confidence | Decision | Action |
+  |---|---|---|
+  | `> 0.90` | **auto-approve** | proceeds to the post-approval actions in `/api/checkout/pay` |
+  | `0.60 – 0.90` | **manager review** | held; image + score pushed to the manager tablet, 60 s server-side timer |
+  | `≤ 0.60` | **auto-block** | fraud-alert flow (email + `fraud_incidents` + broadcast) |
+
+  Manager review resolves via `POST /api/checkout/capture-review/:txnRef`
+  (approve → commit; reject → block); **no response within 60 s → auto-block**,
+  logged distinctly (`review_timeout`) from an explicit rejection.
+- **Live pipeline over WebSocket.** Each Redis state transition —
+  `image_uploading → image_uploaded → yolo_processing → pending_manager |
+  approved | blocked` — is pushed to the checkout display (same channel as the
+  gate result).
+- **Storage-failure resilience.** The local write retries with exponential
+  backoff (base 1 s, doubling); if it still fails, the store policy
+  (`CAPTURE_WRITE_FAILURE_POLICY`) either hard-blocks or accepts a **logged,
+  HMAC-verified image-less fallback**, capped at 3 in 15 minutes before the lane
+  **freezes**. Camera hardware faults feed the same lane-health path.
+
+> Relevant env vars: `CHECKOUT_CAPTURES_DIR`, `CAPTURE_HMAC_SECRET`,
+> `CAPTURE_TOKEN_TTL`, `CAPTURE_STATE_TTL`, `CAPTURE_AUTO_APPROVE_THRESHOLD`,
+> `CAPTURE_AUTO_BLOCK_THRESHOLD`, `CAPTURE_REVIEW_TIMEOUT_S`,
+> `CAPTURE_WRITE_MAX_ATTEMPTS`, `CAPTURE_WRITE_FAILURE_POLICY`, `LANE_FAULT_MAX`,
+> `LANE_FAULT_WINDOW_S`, `LANE_FREEZE_TTL_S`. See
+> `docs/CAPTURE_E2E_RUNBOOK.md` for end-to-end verification.
+
 ---
 
 ## Pillar B — Conversational Auditor & Refund Flow
