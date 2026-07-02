@@ -41,6 +41,8 @@ const knowledgeBase           = require('./lib/knowledgeBase');
 const { createBudgetEngine }  = require('./lib/budgetEngine');
 const { createAuditor }       = require('./lib/auditor');
 const { createCaptureThresholds } = require('./lib/captureThresholds');
+const { retryWithBackoff }        = require('./lib/retry');
+const { writeFailureDecision, resolveReviewOutcome } = require('./lib/captureResilience');
 const { createCustomerAssistant } = require('./lib/customerAssistant');
 const { generateTransactionId } = require('./lib/txnId');
 
@@ -1067,27 +1069,6 @@ const LANE_FAULT_MAX      = parseInt(process.env.LANE_FAULT_MAX)      || 3;     
 const LANE_FAULT_WINDOW_S = parseInt(process.env.LANE_FAULT_WINDOW_S) || 15 * 60;     // …within this rolling window (15 min)
 const LANE_FREEZE_TTL_S   = parseInt(process.env.LANE_FREEZE_TTL_S)   || 15 * 60;     // freeze auto-thaws after this
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// Generic exponential-backoff retry: runs fn up to `attempts` times with delays
-// baseDelayMs, 2×, 4×, … (default 1s → 2s → 4s). Returns fn's result, or throws
-// the last error once all attempts are exhausted.
-async function retryWithBackoff(fn, { attempts = 3, baseDelayMs = 1000, label = 'operation' } = {}) {
-    let lastErr;
-    for (let i = 0; i < attempts; i++) {
-        try { return await fn(i); }
-        catch (e) {
-            lastErr = e;
-            if (i < attempts - 1) {
-                const delay = baseDelayMs * (2 ** i);
-                console.warn(`⏳ ${label} failed (attempt ${i + 1}/${attempts}): ${e.message} — retrying in ${delay}ms`);
-                await sleep(delay);
-            }
-        }
-    }
-    throw lastErr;
-}
-
 function laneFaultKey(shopId)  { return `capture:fault:${shopId}`; }
 function laneFrozenKey(shopId) { return `lane:frozen:${shopId}`; }
 
@@ -1141,7 +1122,7 @@ async function handleCaptureWriteFailure(res, shop, payload, state, err) {
     console.error(`💾 Capture write FAILED after ${CAPTURE_WRITE_MAX_ATTEMPTS} attempts — shop ${shop.id}, txn ${payload.txn_ref}: ${err.message}`);
 
     // Policy A: hard block — no stored image means this item cannot proceed.
-    if (CAPTURE_WRITE_FAILURE_POLICY === 'hard_block') {
+    if (writeFailureDecision({ policy: CAPTURE_WRITE_FAILURE_POLICY, faultCount: 0, maxFaults: LANE_FAULT_MAX }) === 'hard_block') {
         state.status = CAPTURE_STATE.BLOCKED;
         state.write_error = err.message;
         await commitCaptureState(state, { reason: 'write_failed', message: 'Could not store the checkout image — capture blocked.' });
@@ -1152,7 +1133,8 @@ async function handleCaptureWriteFailure(res, shop, payload, state, err) {
     // was verified, so accept an image-less capture and let checkout continue.
     // Cap these: past LANE_FAULT_MAX within the window, freeze the lane.
     const count = await recordLaneFault(shop.id, 'write_fallback', `${payload.txn_ref}: ${err.message}`);
-    if (count > LANE_FAULT_MAX) {
+    const decision = writeFailureDecision({ policy: CAPTURE_WRITE_FAILURE_POLICY, faultCount: count, maxFaults: LANE_FAULT_MAX });
+    if (decision === 'freeze') {
         await freezeLane(shop.id, `Repeated checkout-image write failures (${count} in ${Math.round(LANE_FAULT_WINDOW_S / 60)} min).`);
         state.status = CAPTURE_STATE.BLOCKED;
         state.write_error = err.message;
@@ -1668,7 +1650,12 @@ async function resolveCaptureReview(txnRef, outcome) {
         clearReviewTimer(txnRef);
 
         const { shop_id: shopId, barcode, product_name } = pending;
+        const resolution = resolveReviewOutcome(outcome);   // { band, outcome, action }
+        if (!resolution) return { resolved: false, reason: 'unknown_outcome' };
+
         const record = {
+            band:            resolution.band,
+            outcome:         resolution.outcome,
             confidence:      pending.confidence ?? null,
             thresholds:      pending.thresholds,
             checkout_label:  pending.checkout_label ?? null,
@@ -1677,29 +1664,23 @@ async function resolveCaptureReview(txnRef, outcome) {
             at:              new Date().toISOString(),
         };
 
-        if (outcome === 'approve') {
-            record.band    = captureThresholds.BAND.AUTO_APPROVE;
-            record.outcome = 'manager_approved';
+        if (resolution.band === captureThresholds.BAND.AUTO_APPROVE) {
             // Flip the pay-gate decision to approved so the held item now clears
             // the post-approval actions in /api/checkout/pay.
             await persistCaptureDecision(shopId, barcode, txnRef, record);
             await transitionCaptureState(txnRef, CAPTURE_STATE.APPROVED, {
-                shopId, barcode, decision: 'auto_approve', action: 'CAPTURE_REVIEW_APPROVED',
+                shopId, barcode, decision: 'auto_approve', action: resolution.action,
                 resolved_by: 'manager', confidence: record.confidence, thresholds: record.thresholds,
                 message: 'Manager approved the item — cleared for checkout.',
             });
             console.log(`✅ Capture REVIEW-APPROVED ${txnRef} (barcode ${barcode}) by manager.`);
         } else {
-            // reject or timeout → auto-block, but logged with distinct actions.
-            const isTimeout = outcome === 'timeout';
-            record.band    = captureThresholds.BAND.AUTO_BLOCK;
-            record.outcome = isTimeout ? 'review_timeout' : 'manager_rejected';
-            const action   = isTimeout ? 'CAPTURE_REVIEW_TIMEOUT' : 'CAPTURE_REVIEW_REJECTED';
-            const extraFlag = isTimeout
+            // reject or timeout → auto-block, logged with distinct actions.
+            const extraFlag = outcome === 'timeout'
                 ? `no manager response within ${CAPTURE_REVIEW_TIMEOUT_S}s — auto-blocked`
                 : 'manager rejected the item after reviewing the captured image';
             await persistCaptureDecision(shopId, barcode, txnRef, record);
-            await fireCaptureBlock(shopId, txnRef, barcode, product_name, record, action, [extraFlag]);
+            await fireCaptureBlock(shopId, txnRef, barcode, product_name, record, resolution.action, [extraFlag]);
         }
 
         // Mark the review resolved so a late tap / stray timer is a no-op.

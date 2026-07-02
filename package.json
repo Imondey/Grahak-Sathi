@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "seed:refund-demo": "node seed-refund-demo.js",
     "seed:image": "node seed-images.js",
-    "test:injection": "node tools/test-injection.js"
+    "test:injection": "node tools/test-injection.js",
+    "test:capture": "node --test tools/test-capture-decision.js"
   },
   "author": "Team Schrodinger",
   "license": "ISC",
