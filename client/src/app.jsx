@@ -7,6 +7,7 @@ import HomePage          from './home.jsx'
 import AdminDashboard    from './admin-dashboard.jsx'
 import CheckoutPage      from './checkout.jsx'
 import TransactionPage   from './transaction.jsx'
+import OrderStatusPage   from './order-status.jsx'
 import ChatbotPage       from './chatbot.jsx'
 import FloatingAssistant from './floating-assistant.jsx'
 
@@ -85,6 +86,7 @@ export default function App() {
         <Route path="/admin"       element={<AuthGuard user={user}><AdminDashboard  user={user} setUser={setUser} /></AuthGuard>} />
         <Route path="/checkout"    element={<AuthGuard user={user}><CheckoutPage    user={user} setUser={setUser} /></AuthGuard>} />
         <Route path="/transaction" element={<AuthGuard user={user}><TransactionPage user={user} setUser={setUser} /></AuthGuard>} />
+        <Route path="/order-status" element={<AuthGuard user={user}><OrderStatusPage user={user} setUser={setUser} /></AuthGuard>} />
 
         {/* ── Catch-all ── */}
         <Route path="*" element={<Navigate to="/" replace />} />

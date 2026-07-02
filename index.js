@@ -319,6 +319,69 @@ async function saveTransactionItem({ transactionId, sessionId = null, userId = n
     }
 }
 
+// Assemble the full order-status payload for a receipt transaction ID: every line
+// item purchased under it plus subtotal / GST / total. This is what the dedicated
+// Order Status page renders when a customer re-scans an already-purchased item.
+async function buildOrderStatus(transactionId) {
+    if (!transactionId) return null;
+    try {
+        const r = await db.query(
+            `SELECT barcode, product_name, quantity, price, mk_id,
+                    purchase_channel, created_at
+               FROM transaction_items
+              WHERE transaction_id = $1
+              ORDER BY created_at ASC, id ASC`,
+            [String(transactionId).trim()]
+        );
+        if (r.rows.length === 0) return null;
+        const items = r.rows.map(row => ({
+            barcode:      row.barcode,
+            product_name: row.product_name || 'Item',
+            quantity:     parseInt(row.quantity) || 1,
+            price:        row.price != null ? parseFloat(row.price) : null,
+            mk_id:        row.mk_id || null,
+        }));
+        const subtotal = items.reduce((s, it) => s + (it.price || 0) * (it.quantity || 1), 0);
+        const gst      = +(subtotal * 0.18).toFixed(2);
+        const total    = +(subtotal + gst).toFixed(2);
+        return {
+            transaction_id:   String(transactionId).trim(),
+            transaction_time: r.rows[0].created_at,
+            channel:          r.rows[0].purchase_channel || 'offline',
+            items,
+            subtotal: +subtotal.toFixed(2),
+            gst,
+            total,
+        };
+    } catch (err) {
+        if (!buildOrderStatus._warned) { console.warn('buildOrderStatus skipped (run migration_transaction_items.sql):', err.message); buildOrderStatus._warned = true; }
+        return null;
+    }
+}
+
+// Look up the most recent completed transaction for a given customer session +
+// barcode. Used when a barcode is re-scanned in a session that already checked it
+// out, so the terminal can route the customer to the Order Status page (with the
+// receipt / transaction number) instead of trying to re-add a duplicate.
+async function findSessionOrderByBarcode(sessionId, barcode) {
+    if (!sessionId || !barcode) return null;
+    try {
+        const head = await db.query(
+            `SELECT transaction_id
+               FROM transaction_items
+              WHERE session_id = $1 AND barcode = $2
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1`,
+            [String(sessionId).trim(), String(barcode).trim()]
+        );
+        if (head.rows.length === 0) return null;
+        return buildOrderStatus(head.rows[0].transaction_id);
+    } catch (err) {
+        if (!findSessionOrderByBarcode._warned) { console.warn('findSessionOrderByBarcode skipped:', err.message); findSessionOrderByBarcode._warned = true; }
+        return null;
+    }
+}
+
 // Best-effort: record the unit in the per-customer purchase history (anti-fraud).
 // customer_purchases.mk_id is NOT NULL, so we only write when we have an MK-ID.
 async function saveCustomerPurchase({ userId, transactionId, mkId, barcode = null, productName = null }) {
@@ -1708,6 +1771,45 @@ async function onCaptureAutoApprove(shopId, txnRef, barcode, product_name, recor
 
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
 
+// GET /api/checkout/order-status — return the order/receipt for an already-scanned
+// barcode in the CURRENT session (or by explicit transaction id). Powers the
+// dedicated Order Status page shown when a customer re-scans a purchased item.
+//   ?barcode=<ean>          → latest transaction in this session containing it
+//   ?transaction_id=<id>    → that specific receipt
+//   (no params)             → latest transaction in this session
+app.get('/api/checkout/order-status', isAuth, async (req, res) => {
+    const shop      = req.session.user;
+    const sessionId = shop.session_token || null;
+    const barcode   = (req.query.barcode || '').toString().trim();
+    const txnId     = (req.query.transaction_id || '').toString().trim();
+
+    try {
+        let order = null;
+
+        if (txnId) {
+            order = await buildOrderStatus(txnId);
+        } else if (sessionId && barcode) {
+            order = await findSessionOrderByBarcode(sessionId, barcode);
+        } else if (sessionId) {
+            // Fall back to the latest transaction for this session (any barcode).
+            const head = await db.query(
+                `SELECT transaction_id FROM transaction_items
+                  WHERE session_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`,
+                [sessionId]
+            );
+            if (head.rows.length) order = await buildOrderStatus(head.rows[0].transaction_id);
+        }
+
+        if (!order)
+            return res.status(404).json({ found: false, message: 'No order found for this item in your session.' });
+
+        return res.json({ found: true, ...order });
+    } catch (err) {
+        console.error('order-status lookup error:', err.message);
+        return res.status(500).json({ found: false, message: 'Could not load order status.' });
+    }
+});
+
 app.post('/api/checkout/verify', isAuth, async (req, res) => {
     const { barcode, mk_id } = req.body;
     if (!barcode || typeof barcode !== 'string' || barcode.trim().length < 4)
@@ -1732,6 +1834,9 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
 
         if (added === 0) {
             console.warn(`🚫 Duplicate UID rejected: ${uidValue} in session ${sessionToken}`);
+            // If this barcode was already checked out in this session, surface the
+            // existing receipt so the terminal can open the Order Status page.
+            const existingOrder = await findSessionOrderByBarcode(shop.session_token, barcode.trim());
             return res.status(409).json({
                 status:  'duplicate_uid',
                 message: mk_id
@@ -1739,6 +1844,8 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
                     : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`,
                 barcode: barcode.trim(),
                 mk_id:   mk_id || null,
+                transaction_id: existingOrder ? existingOrder.transaction_id : null,
+                order:          existingOrder || null,
             });
         }
     } catch (redisErr) {
@@ -2051,6 +2158,9 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
 
         if (added === 0) {
             console.warn(`🚫 Duplicate UID rejected (match-verify): ${uidValue} in session ${sessionToken}`);
+            // If this barcode was already checked out in this session, surface the
+            // existing receipt so the terminal can open the Order Status page.
+            const existingOrder = await findSessionOrderByBarcode(shop.session_token, barcode.trim());
             return res.status(409).json({
                 found:   true,
                 match:   false,
@@ -2060,6 +2170,8 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
                     : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`,
                 barcode: barcode.trim(),
                 mk_id:   mk_id || null,
+                transaction_id: existingOrder ? existingOrder.transaction_id : null,
+                order:          existingOrder || null,
             });
         }
     } catch (redisErr) {

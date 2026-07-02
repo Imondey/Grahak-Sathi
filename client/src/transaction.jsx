@@ -543,22 +543,48 @@ export default function TransactionPage({ user, setUser }) {
     setCart(prev => [{ ...item, id: uid(), qty: 1 }, ...prev])
   }
 
+  // Open the dedicated Order Status page for an already-scanned barcode. Uses the
+  // order supplied inline by the duplicate-scan response when available, otherwise
+  // looks it up from the current session. Returns true if it navigated away.
+  async function openOrderStatusFor(barcodeValue, inlineOrder = null, txnId = null) {
+    if (inlineOrder || txnId) {
+      navigate('/order-status', { state: { order: inlineOrder || null, transactionId: txnId || null, barcode: barcodeValue } })
+      return true
+    }
+    try {
+      const r = await fetch(`/api/checkout/order-status?barcode=${encodeURIComponent(barcodeValue)}`, { credentials: 'include' })
+      if (r.ok) {
+        const od = await r.json().catch(() => ({}))
+        if (od.found) {
+          navigate('/order-status', { state: { order: od, transactionId: od.transaction_id, barcode: barcodeValue } })
+          return true
+        }
+      }
+    } catch {}
+    return false
+  }
+
   const handleVerified = useCallback(async (data, barcodeValue, productB64, errMsg, mkIdValue) => {
     if (errMsg || !data) {
       // Check if the error is a duplicate UID (409)
       if (errMsg && errMsg.includes('409')) {
-        showToast(`This product was already scanned in this session. Use a different unit or provide its MK ID.`, 'warn')
         setScannerOpen(false)
+        // If it maps to an existing order in this session, show its status page.
+        if (await openOrderStatusFor(barcodeValue)) return
+        showToast(`This product was already scanned in this session. Use a different unit or provide its MK ID.`, 'warn')
         return
       }
       showToast(`Verification failed${errMsg ? ': ' + errMsg : ''}`, 'error')
       return
     }
 
-    // Handle duplicate_uid response from backend
+    // Handle duplicate_uid response from backend — already scanned this session.
     if (data.status === 'duplicate_uid') {
-      showToast(data.message || 'This product was already scanned in this session.', 'warn')
       setScannerOpen(false)
+      // If this item already belongs to a completed transaction in this session,
+      // open the Order Status page showing its transaction number + order details.
+      if (await openOrderStatusFor(barcodeValue, data.order, data.transaction_id)) return
+      showToast(data.message || 'This product was already scanned in this session.', 'warn')
       return
     }
 
