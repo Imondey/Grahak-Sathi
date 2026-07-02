@@ -1183,7 +1183,18 @@ async function scoreCaptureMatch(shopId, txnRef, state, ref) {
 //   • and, for auto-block, the existing fraud-alert flow.
 const CAPTURE_DECISION_TTL_S = parseInt(process.env.CAPTURE_DECISION_TTL_S) || 4 * 60 * 60; // 4h
 
+// How long the manager's tablet has to approve/reject a borderline capture
+// before the server auto-blocks it (no response = fail-safe to blocked).
+const CAPTURE_REVIEW_TIMEOUT_S = parseInt(process.env.CAPTURE_REVIEW_TIMEOUT_S) || 60;
+
+// In-process registry of live review timers, keyed by txnRef, so a manager tap
+// can cancel the pending 60s auto-block. `resolvingReviews` is a synchronous
+// mutex: a review resolves exactly once even if a tap and the timeout race.
+const pendingReviewTimers = new Map();
+const resolvingReviews    = new Set();
+
 function captureDecisionKey(shopId, barcode) { return `capture:decision:${shopId}:${barcode}`; }
+function captureReviewKey(txnRef)             { return `capture:review:${txnRef}`; }
 
 // Read the recorded capture decision for a shop+barcode (null when none yet).
 async function readCaptureDecision(shopId, barcode) {
@@ -1206,6 +1217,10 @@ async function resolveShop(shopId) {
 }
 
 // Persist the decision for the pay-time gate (Redis) + the audit trail (txn row).
+// The Redis pay-gate key keeps the COARSE band (auto_approve / manager_review /
+// auto_block) that /api/checkout/pay reads. The transaction row stores the more
+// GRANULAR outcome when available (manager_approved / manager_rejected /
+// review_timeout) so the review paths can be tuned separately later.
 async function persistCaptureDecision(shopId, barcode, txnRef, record) {
     if (barcode) {
         try {
@@ -1219,7 +1234,7 @@ async function persistCaptureDecision(shopId, barcode, txnRef, record) {
               WHERE id = (SELECT id FROM transactions
                            WHERE shop_id = $2 AND barcode = $3
                            ORDER BY scanned_at DESC LIMIT 1)`,
-            [record.band, shopId, barcode],
+            [record.outcome || record.band, shopId, barcode],
         );
     } catch (e) {
         if (!persistCaptureDecision._warned) {
@@ -1247,7 +1262,7 @@ async function applyCaptureDecision(shopId, txnRef, state, d, band) {
     await persistCaptureDecision(shopId, barcode, txnRef, record);
 
     if (band === captureThresholds.BAND.AUTO_BLOCK) {
-        await onCaptureAutoBlock(shopId, txnRef, barcode, product_name, record);
+        await fireCaptureBlock(shopId, txnRef, barcode, product_name, record, 'CAPTURE_MISMATCH_BLOCKED');
     } else if (band === captureThresholds.BAND.MANAGER_REVIEW) {
         await onCaptureManagerReview(shopId, txnRef, barcode, product_name, record);
     } else {
@@ -1256,66 +1271,226 @@ async function applyCaptureDecision(shopId, txnRef, state, d, band) {
     return record;
 }
 
-// AUTO-BLOCK → the item photographed at checkout does not match the scanned SKU
-// (classic ticket-switch / item-substitution). Reuse the existing fraud-alert
-// flow: instant "why blocked?" broadcast, manager email, and a durable incident
-// log — identical to the barcode-fraud path in /api/checkout/verify.
-async function onCaptureAutoBlock(shopId, txnRef, barcode, product_name, record) {
+// Block a capture and fire the existing fraud-alert flow: instant "why blocked?"
+// broadcast, manager email, and a durable incident log — identical to the
+// barcode-fraud path in /api/checkout/verify. `action` distinguishes WHY it was
+// blocked so incidents can be tuned per cause:
+//   CAPTURE_MISMATCH_BLOCKED  — auto-block, score ≤ block threshold
+//   CAPTURE_REVIEW_REJECTED   — a manager explicitly rejected it
+//   CAPTURE_REVIEW_TIMEOUT    — no manager response within the review window
+async function fireCaptureBlock(shopId, txnRef, barcode, product_name, record, action = 'CAPTURE_MISMATCH_BLOCKED', extraFlags = []) {
     const conf = record.confidence ?? 0;
     // Frame the risk from the (low) match confidence so the existing fraud
     // template renders a sensible percentage.
     const riskScore = Math.round((1 - conf) * 100) / 100;
-    const flags = [
-        `capture-match ${(conf * 100).toFixed(0)}% ≤ block threshold ${(record.thresholds.autoBlock * 100).toFixed(0)}%`,
-    ];
+    const flags = [];
+    if (action === 'CAPTURE_MISMATCH_BLOCKED') {
+        flags.push(`capture-match ${(conf * 100).toFixed(0)}% ≤ block threshold ${(record.thresholds.autoBlock * 100).toFixed(0)}%`);
+    } else {
+        flags.push(`capture-match ${(conf * 100).toFixed(0)}% fell in the manager-review band (${(record.thresholds.autoBlock * 100).toFixed(0)}–${(record.thresholds.autoApprove * 100).toFixed(0)}%)`);
+    }
     if (record.checkout_label && record.reference_label && record.checkout_label !== record.reference_label) {
         flags.push(`bagged item looks like '${record.checkout_label}' but the scanned SKU reference is '${record.reference_label}'`);
     }
+    for (const f of extraFlags) if (f) flags.push(f);
 
     const shop = await resolveShop(shopId);
     let explanation = null;
     if (shop) {
         explanation = await broadcastFraudExplanation(shop, {
             barcode, product_name, risk_score: riskScore,
-            action: 'CAPTURE_MISMATCH_BLOCKED', intelligence_flags: flags,
+            action, intelligence_flags: flags,
         }).catch(err => { console.warn('capture fraud explanation failed:', err.message); return null; });
 
         sendFraudAlertEmail(shop, {
             barcode, product_name, risk_score: riskScore,
-            timestamp: new Date().toISOString(), action: 'CAPTURE_MISMATCH_BLOCKED',
+            timestamp: new Date().toISOString(), action,
             intelligence_flags: flags.join(' | '),
             ai_explanation:     explanation ? explanation.text : null,
             explanation_source: explanation ? explanation.source : null,
         }).catch(err => console.error('capture fraud email failed:', err.message));
     } else {
-        console.warn(`capture auto-block: shop ${shopId} not resolvable — manager email skipped (incident still logged).`);
+        console.warn(`capture block (${action}): shop ${shopId} not resolvable — manager email skipped (incident still logged).`);
     }
 
     try {
         await db.query(
             `INSERT INTO fraud_incidents (shop_id, barcode, product_name, risk_score, action, incident_at)
              VALUES ($1,$2,$3,$4,$5,NOW())`,
-            [shopId, barcode, product_name || 'Unknown', riskScore, 'CAPTURE_MISMATCH_BLOCKED'],
+            [shopId, barcode, product_name || 'Unknown', riskScore, action],
         );
     } catch (e) { console.warn('capture fraud_incidents insert skipped:', e.message); }
 
+    const blockedMessages = {
+        CAPTURE_MISMATCH_BLOCKED: 'Captured item does not match the scanned product — sale blocked, manager notified.',
+        CAPTURE_REVIEW_REJECTED:  'Manager rejected the item after review — sale blocked.',
+        CAPTURE_REVIEW_TIMEOUT:   `No manager response within ${CAPTURE_REVIEW_TIMEOUT_S}s — sale auto-blocked.`,
+    };
     broadcastToShop(shopId, {
-        type: 'CAPTURE_DECISION', decision: 'auto_block', txn_ref: txnRef, barcode,
+        type: 'CAPTURE_DECISION', decision: 'auto_block', action, txn_ref: txnRef, barcode,
         confidence: record.confidence, thresholds: record.thresholds,
-        message: 'Captured item does not match the scanned product — sale blocked, manager notified.',
+        resolved_by: action === 'CAPTURE_MISMATCH_BLOCKED' ? 'auto'
+                   : action === 'CAPTURE_REVIEW_REJECTED'  ? 'manager' : 'timeout',
+        message: blockedMessages[action] || blockedMessages.CAPTURE_MISMATCH_BLOCKED,
     });
-    console.warn(`🚨 Capture AUTO-BLOCK ${txnRef} (barcode ${barcode}, confidence ${record.confidence}) — fraud alert fired.`);
+    console.warn(`🚨 Capture BLOCK ${txnRef} (${action}, barcode ${barcode}, confidence ${record.confidence}) — fraud alert fired.`);
 }
 
-// MANAGER REVIEW → borderline match. Don't auto-complete; surface it to the shop
-// terminals so a human decides. /api/checkout/pay holds these items.
+// MANAGER REVIEW → borderline match. Push the captured image + score + product
+// context to the manager's tablet over the shop's WebSocket channel, hold the
+// item at /api/checkout/pay, and start a server-side 60s timer. The manager taps
+// approve/reject (→ resolveCaptureReview); if nobody responds in time the timer
+// fires and the item is auto-blocked (fail-safe).
 async function onCaptureManagerReview(shopId, txnRef, barcode, product_name, record) {
+    const now      = Date.now();
+    const deadline = now + CAPTURE_REVIEW_TIMEOUT_S * 1000;
+
+    // Persist the pending review so the approve/reject endpoint (and the
+    // exactly-once guard) have a durable source of truth independent of the timer.
+    const pending = {
+        status:          'pending',
+        shop_id:         shopId,
+        txn_ref:         txnRef,
+        barcode,
+        product_name:    product_name || null,
+        confidence:      record.confidence ?? null,
+        thresholds:      record.thresholds,
+        checkout_label:  record.checkout_label ?? null,
+        reference_label: record.reference_label ?? null,
+        created_at:      new Date(now).toISOString(),
+        deadline_at:     new Date(deadline).toISOString(),
+    };
+    try {
+        // Keep the key a little past the deadline so a late tap gets a clean
+        // "already resolved/expired" answer rather than a missing key.
+        await redisClient.set(captureReviewKey(txnRef), JSON.stringify(pending), { EX: CAPTURE_REVIEW_TIMEOUT_S + 30 });
+    } catch (e) { console.warn('pending review store failed (non-fatal):', e.message); }
+
+    // Push the review request — including the captured frame — to the tablet(s).
     broadcastToShop(shopId, {
-        type: 'CAPTURE_DECISION', decision: 'manager_review', txn_ref: txnRef, barcode,
-        confidence: record.confidence, thresholds: record.thresholds,
-        message: 'Capture match is borderline — held for manager review before the sale can complete.',
+        type:            'CAPTURE_REVIEW_REQUEST',
+        txn_ref:         txnRef,
+        barcode,
+        product_name:    product_name || null,
+        confidence:      record.confidence,
+        thresholds:      record.thresholds,
+        checkout_label:  record.checkout_label ?? null,
+        reference_label: record.reference_label ?? null,
+        image:           readCaptureImageDataUrl(shopId, txnRef),   // data URL, or null
+        timeout_seconds: CAPTURE_REVIEW_TIMEOUT_S,
+        deadline_at:     pending.deadline_at,
+        message:         `Borderline capture match — approve or reject within ${CAPTURE_REVIEW_TIMEOUT_S}s, otherwise it is auto-blocked.`,
     });
-    console.log(`🕵️  Capture MANAGER-REVIEW ${txnRef} (barcode ${barcode}, confidence ${record.confidence}).`);
+
+    startReviewTimer(txnRef);
+    console.log(`🕵️  Capture MANAGER-REVIEW ${txnRef} (barcode ${barcode}, confidence ${record.confidence}) — pushed to tablet, ${CAPTURE_REVIEW_TIMEOUT_S}s timer armed.`);
+}
+
+// Read the captured checkout frame back as a data URL so it can ride the
+// WebSocket channel straight to the tablet (no separate authenticated fetch).
+function readCaptureImageDataUrl(shopId, txnRef) {
+    try {
+        const abs = path.join(CHECKOUT_CAPTURES_ROOT, String(shopId), `${txnRef}.jpg`);
+        if (!fs.existsSync(abs)) return null;
+        return `data:image/jpeg;base64,${fs.readFileSync(abs).toString('base64')}`;
+    } catch (e) {
+        console.warn('capture image read for review failed:', e.message);
+        return null;
+    }
+}
+
+// Arm the server-side auto-block timer for a pending review. Cleared by a manual
+// tap; if it fires, the item is auto-blocked and logged as a TIMEOUT.
+function startReviewTimer(txnRef) {
+    clearReviewTimer(txnRef);
+    const timer = setTimeout(() => {
+        pendingReviewTimers.delete(txnRef);
+        resolveCaptureReview(txnRef, 'timeout')
+            .catch(e => console.error(`capture review timeout handler failed for ${txnRef}:`, e.message));
+    }, CAPTURE_REVIEW_TIMEOUT_S * 1000);
+    if (timer.unref) timer.unref();   // don't keep the process alive on this alone
+    pendingReviewTimers.set(txnRef, timer);
+}
+
+function clearReviewTimer(txnRef) {
+    const t = pendingReviewTimers.get(txnRef);
+    if (t) { clearTimeout(t); pendingReviewTimers.delete(txnRef); }
+}
+
+// Fetch the pending-review record (null if none / already resolved-and-expired).
+async function getPendingReview(txnRef) {
+    try {
+        const raw = await redisClient.get(captureReviewKey(txnRef));
+        return raw ? JSON.parse(raw) : null;
+    } catch (e) { console.warn('pending review read failed:', e.message); return null; }
+}
+
+/**
+ * Resolve a borderline capture review EXACTLY ONCE and route it into the same
+ * approve/block logic as the automatic paths.
+ *   outcome 'approve' → AUTO-APPROVE (pay proceeds through the post-approval actions)
+ *   outcome 'reject'  → AUTO-BLOCK, logged as CAPTURE_REVIEW_REJECTED
+ *   outcome 'timeout' → AUTO-BLOCK, logged as CAPTURE_REVIEW_TIMEOUT (distinct from reject)
+ * Returns { resolved, outcome | reason }.
+ */
+async function resolveCaptureReview(txnRef, outcome) {
+    // Synchronous mutex: whichever of {tap, timeout} enters first wins; the other
+    // sees the flag (no await between has/add) and bails.
+    if (resolvingReviews.has(txnRef)) return { resolved: false, reason: 'in_progress' };
+    resolvingReviews.add(txnRef);
+    try {
+        const pending = await getPendingReview(txnRef);
+        if (!pending || pending.status !== 'pending') {
+            return { resolved: false, reason: 'not_pending' };
+        }
+        clearReviewTimer(txnRef);
+
+        const { shop_id: shopId, barcode, product_name } = pending;
+        const record = {
+            confidence:      pending.confidence ?? null,
+            thresholds:      pending.thresholds,
+            checkout_label:  pending.checkout_label ?? null,
+            reference_label: pending.reference_label ?? null,
+            txn_ref:         txnRef,
+            at:              new Date().toISOString(),
+        };
+
+        if (outcome === 'approve') {
+            record.band    = captureThresholds.BAND.AUTO_APPROVE;
+            record.outcome = 'manager_approved';
+            // Flip the pay-gate decision to approved so the held item now clears
+            // the post-approval actions in /api/checkout/pay.
+            await persistCaptureDecision(shopId, barcode, txnRef, record);
+            broadcastToShop(shopId, {
+                type: 'CAPTURE_DECISION', decision: 'auto_approve', action: 'CAPTURE_REVIEW_APPROVED',
+                resolved_by: 'manager', txn_ref: txnRef, barcode,
+                confidence: record.confidence, thresholds: record.thresholds,
+                message: 'Manager approved the item — cleared for checkout.',
+            });
+            console.log(`✅ Capture REVIEW-APPROVED ${txnRef} (barcode ${barcode}) by manager.`);
+        } else {
+            // reject or timeout → auto-block, but logged with distinct actions.
+            const isTimeout = outcome === 'timeout';
+            record.band    = captureThresholds.BAND.AUTO_BLOCK;
+            record.outcome = isTimeout ? 'review_timeout' : 'manager_rejected';
+            const action   = isTimeout ? 'CAPTURE_REVIEW_TIMEOUT' : 'CAPTURE_REVIEW_REJECTED';
+            const extraFlag = isTimeout
+                ? `no manager response within ${CAPTURE_REVIEW_TIMEOUT_S}s — auto-blocked`
+                : 'manager rejected the item after reviewing the captured image';
+            await persistCaptureDecision(shopId, barcode, txnRef, record);
+            await fireCaptureBlock(shopId, txnRef, barcode, product_name, record, action, [extraFlag]);
+        }
+
+        // Mark the review resolved so a late tap / stray timer is a no-op.
+        try {
+            const resolvedState = { ...pending, status: record.outcome, resolved_at: record.at };
+            await redisClient.set(captureReviewKey(txnRef), JSON.stringify(resolvedState), { EX: 300 });
+        } catch (e) { console.warn('pending review resolve-write failed (non-fatal):', e.message); }
+
+        return { resolved: true, outcome: record.outcome };
+    } finally {
+        resolvingReviews.delete(txnRef);
+    }
 }
 
 // AUTO-APPROVE → confident match. Clear the item so the post-approval actions in
@@ -2553,6 +2728,33 @@ app.post('/api/admin/capture-thresholds', isAdmin, async (req, res) => {
     const resolved = await captureThresholds.set(shopId, { autoApprove, autoBlock });
     console.log(`🎚️  Capture-match thresholds for shop ${shopId} set to approve>${resolved.autoApprove}, block<=${resolved.autoBlock}`);
     res.json({ shopId, ...resolved, updated: true });
+});
+
+// POST /api/checkout/capture-review/:txnRef — manager approve/reject tap.
+// Body: { action: 'approve' | 'reject' }. Routes into the SAME approve/block
+// logic as the automatic paths (approve → sale proceeds; reject → auto-block +
+// fraud alert). Idempotent: once resolved (by a tap or the 60s timeout) further
+// taps return 409. Manager-authenticated and scoped to their own store.
+app.post('/api/checkout/capture-review/:txnRef', isAdmin, async (req, res) => {
+    const txnRef = String(req.params.txnRef || '').trim();
+    const action = String(req.body?.action || '').toLowerCase();
+
+    if (!['approve', 'reject'].includes(action))
+        return res.status(400).json({ ok: false, message: "action must be 'approve' or 'reject'." });
+
+    const pending = await getPendingReview(txnRef);
+    if (!pending)
+        return res.status(404).json({ ok: false, message: 'No review found for this transaction (it may have expired).' });
+    if (String(pending.shop_id) !== String(req.session.user.id))
+        return res.status(403).json({ ok: false, message: 'This review belongs to a different store.' });
+    if (pending.status !== 'pending')
+        return res.status(409).json({ ok: false, message: 'This review was already resolved.', status: pending.status });
+
+    const result = await resolveCaptureReview(txnRef, action);
+    if (!result.resolved)
+        return res.status(409).json({ ok: false, message: 'This review was already resolved.', reason: result.reason });
+
+    res.json({ ok: true, txn_ref: txnRef, outcome: result.outcome });
 });
 
 
