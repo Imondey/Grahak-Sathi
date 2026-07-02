@@ -1,0 +1,15 @@
+# Post-gate checkout evidence captures live here at runtime.
+#
+# Convention:  store-data/checkout-captures/{shop_id}/{txn_ref}.jpg
+#
+#   - One image per APPROVED scan, written by POST /api/checkout/capture only
+#     after the scan clears the verification gate (an HMAC capture token is
+#     issued exclusively on gate-pass). Invalid/blocked scans never produce a
+#     capture.
+#   - Each write is checksum-verified (sha256, read back from disk) and the
+#     resulting reference (path + checksum + timestamp) is bound to the
+#     transaction state in Redis (txn:capture:{txn_ref}).
+#   - Scoped per shop_id so captures never leak between tenants.
+#
+# The actual .jpg files are git-ignored (see .gitignore); this .gitkeep only
+# preserves the directory + documents the convention in the repo.

@@ -9,6 +9,12 @@ uploads/
 store-data/reference-images/*
 !store-data/reference-images/.gitkeep
 
+# Post-gate checkout evidence captures (per-shop, transaction-scoped) — runtime
+# assets written by /api/checkout/capture. Ignore the images, keep the folder so
+# the convention (store-data/checkout-captures/{shop_id}/{txn_ref}.jpg) is visible.
+store-data/checkout-captures/*
+!store-data/checkout-captures/.gitkeep
+
 
 # Python bytecode / caches
 __pycache__/

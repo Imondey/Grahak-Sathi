@@ -41,11 +41,15 @@ export default function CheckoutPage({ user, setUser }) {
   const [redisStatus, setRedisStatus] = useState('checking')
   const [toast, setToast]         = useState({ msg:'', type:'', show:false })
   const [flash, setFlash]         = useState('')
+  const [captureStatus, setCaptureStatus] = useState(null)   // { txnRef, state:'capturing'|'stored'|'skipped'|'error', ref?, reason? }
+  const [cameraReady, setCameraReady] = useState(false)
   const scanBufferRef = useRef('')
   const scanTimerRef  = useRef(null)
   const inputRef      = useRef(null)
   const wsRef         = useRef(null)
   const activeBarcode = useRef('')
+  const videoRef      = useRef(null)
+  const streamRef     = useRef(null)
 
   useEffect(() => {
     fetch('/api/health', { credentials:'include' })
@@ -117,12 +121,69 @@ export default function CheckoutPage({ user, setUser }) {
     setUser(null); navigate('/')
   }
 
+  // ── Overhead camera (best-effort) ────────────────────────────────────────
+  // Started once so a frame can be grabbed the instant a scan is approved. If
+  // the browser denies / has no camera, capture degrades gracefully to skipped;
+  // the server-side security property (no capture without a gate-pass token) is
+  // unaffected either way.
+  useEffect(() => {
+    let cancelled = false
+    async function initCamera() {
+      if (!navigator.mediaDevices?.getUserMedia) return
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false })
+        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return }
+        streamRef.current = stream
+        if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play().catch(()=>{}) }
+        setCameraReady(true)
+      } catch {
+        setCameraReady(false)
+      }
+    }
+    initCamera()
+    return () => { cancelled = true; streamRef.current?.getTracks().forEach(t => t.stop()) }
+  }, [])
+
+  // Grab a JPEG frame from the live camera as a data URL (null if unavailable).
+  function grabFrame() {
+    const v = videoRef.current
+    if (!v || !v.videoWidth) return null
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = v.videoWidth; canvas.height = v.videoHeight
+      canvas.getContext('2d').drawImage(v, 0, 0, canvas.width, canvas.height)
+      return canvas.toDataURL('image/jpeg', 0.7)
+    } catch { return null }
+  }
+
+  // Fires ONLY from the approved branch of handleScan, using the capture_token
+  // the server issued on gate-pass. Never called for blocked/duplicate scans.
+  async function captureAndUpload(data) {
+    if (!data?.capture_token) return
+    const txnRef = data.txn_ref
+    const frame = grabFrame()
+    if (!frame) { setCaptureStatus({ txnRef, state:'skipped', reason: cameraReady ? 'no frame' : 'camera unavailable' }); return }
+    setCaptureStatus({ txnRef, state:'capturing' })
+    try {
+      const res = await fetch('/api/checkout/capture', {
+        method:'POST', headers:{ 'Content-Type':'application/json' }, credentials:'include',
+        body: JSON.stringify({ capture_token: data.capture_token, image_b64: frame }),
+      })
+      const out = await res.json().catch(()=>({}))
+      if (res.ok && out.ok) setCaptureStatus({ txnRef, state:'stored', ref: out.image_ref })
+      else setCaptureStatus({ txnRef, state:'error', reason: out.message || `HTTP ${res.status}` })
+    } catch (e) {
+      setCaptureStatus({ txnRef, state:'error', reason: e.message })
+    }
+  }
+
 
   const handleScan = useCallback(async (barcode) => {
     if (!barcode || barcode.length < 4 || loading) return
     activeBarcode.current = barcode
     setLoading(true)
     setGateLocked(true)
+    setCaptureStatus(null)
     setBarcodeInput(barcode)
     setVerdict({ _processing: true, barcode })
 
@@ -163,6 +224,13 @@ export default function CheckoutPage({ user, setUser }) {
         blocked:  s.blocked  + (data.status==='blocked' ?1:0),
       }))
       flashScreen(data.status==='approved'?'green':'red')
+
+      // Camera capture fires ONLY after the gate passes (approved) — the server
+      // issues data.capture_token only in that case, so blocked/duplicate scans
+      // never reach here with a token and no image is ever captured for them.
+      if (data.status==='approved' && data.capture_token) {
+        captureAndUpload(data)
+      }
 
       if (data.status==='blocked' && data.fraud_risk>0.6) {
         setFraudFlags(f=>f+1)
@@ -248,6 +316,9 @@ export default function CheckoutPage({ user, setUser }) {
 
       {/* Flash overlay */}
       <div style={{position:'fixed',inset:0,zIndex:500,pointerEvents:'none',opacity:flash?1:0,background:flash==='green'?'rgba(134,239,172,.06)':flash==='red'?'rgba(252,165,165,.06)':'transparent',transition:'opacity .1s'}} />
+
+      {/* Overhead capture camera (hidden) — a frame is grabbed on gate-pass */}
+      <video ref={videoRef} muted playsInline style={{ position:'fixed', width:1, height:1, opacity:0, pointerEvents:'none', bottom:0, right:0 }} />
 
       {/* Background */}
       <div style={{position:'fixed',inset:0,zIndex:0,background:'#000'}} />
@@ -371,6 +442,36 @@ export default function CheckoutPage({ user, setUser }) {
                     ))}
                   </div>
 
+                  {/* Evidence capture — fires only after gate-pass (approved) */}
+                  {verdict.status==='approved' && captureStatus && (
+                    <div style={{margin:'16px 22px 20px',padding:'12px 16px',borderRadius:12,background:'rgba(134,239,172,.05)',border:'1px solid rgba(134,239,172,.2)'}}>
+                      <div style={{display:'flex',alignItems:'center',gap:8,fontFamily:'monospace',fontSize:10,fontWeight:700,letterSpacing:'1.2px',textTransform:'uppercase',color:'#86efac'}}>
+                        <span style={{fontSize:13}}>📸</span>
+                        Evidence Capture
+                        {(() => {
+                          const map = {
+                            capturing: ['CAPTURING…','#fcd34d','rgba(252,211,77,.1)','rgba(252,211,77,.3)'],
+                            stored:    ['STORED · CHECKSUM OK','#86efac','rgba(134,239,172,.12)','rgba(134,239,172,.35)'],
+                            skipped:   ['SKIPPED','#94a3b8','rgba(148,163,184,.1)','rgba(148,163,184,.3)'],
+                            error:     ['FAILED','#fca5a5','rgba(252,165,165,.1)','rgba(252,165,165,.35)'],
+                          }
+                          const [label,c,bg,bd] = map[captureStatus.state] || map.skipped
+                          return <span style={{marginLeft:'auto',padding:'2px 8px',borderRadius:6,fontSize:9,letterSpacing:'.5px',color:c,background:bg,border:`1px solid ${bd}`}}>{label}</span>
+                        })()}
+                      </div>
+                      {captureStatus.state==='stored' && captureStatus.ref && (
+                        <div style={{marginTop:8,fontFamily:'monospace',fontSize:11,color:'#c4b5fd',lineHeight:1.7,wordBreak:'break-all'}}>
+                          <div><span style={{color:'#4c1d95'}}>ref&nbsp;&nbsp;&nbsp;</span> {captureStatus.txnRef}</div>
+                          <div><span style={{color:'#4c1d95'}}>path&nbsp;&nbsp;</span> {captureStatus.ref.path}</div>
+                          <div><span style={{color:'#4c1d95'}}>sha256</span> {String(captureStatus.ref.checksum||'').slice(0,24)}…</div>
+                        </div>
+                      )}
+                      {(captureStatus.state==='skipped' || captureStatus.state==='error') && (
+                        <div style={{marginTop:6,fontFamily:'monospace',fontSize:11,color:'#fcd34d'}}>{captureStatus.reason}</div>
+                      )}
+                    </div>
+                  )}
+
                   {/* Fraud explanation — "why was this blocked?" (Feature: Fraud Alert Explainer) */}
                   {verdict.status==='blocked' && (
                     <div style={{margin:'16px 22px 20px',padding:'14px 16px',borderRadius:12,background:'rgba(252,165,165,.05)',border:'1px solid rgba(252,165,165,.2)'}}>
@@ -479,6 +580,7 @@ export default function CheckoutPage({ user, setUser }) {
               ['Active Locks',  gateLocked?'1':'0',                              gateLocked?'#fcd34d':'#e9d5ff'],
               ['Session Store', 'REDIS',                                          '#86efac'],
               ['Gate Strategy', 'SET NX EX 5',                                   '#a78bfa'],
+              ['Capture Cam',   cameraReady?'READY':'OFF',                        cameraReady?'#86efac':'#fcd34d'],
               ['Fraud Flags',   String(fraudFlags),                              fraudFlags>0?'#fca5a5':'#fcd34d'],
             ].map(([k,v,c])=>(
               <div key={k} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'7px 0',borderBottom:'1px solid rgba(109,40,217,.06)',fontFamily:'monospace',fontSize:11}}>

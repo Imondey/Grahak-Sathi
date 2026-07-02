@@ -996,6 +996,95 @@ app.post('/api/admin/register', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST-GATE CHECKOUT CAPTURE (HMAC-authorised, local storage, Redis-bound ref)
+// ─────────────────────────────────────────────────────────────────────────────
+// Security property: the camera capture must fire ONLY after a scan clears the
+// verification gate (Redis dedup/lock + FastAPI DB + fraud check => 'approved').
+// We enforce this server-side by issuing a short-lived HMAC-signed capture token
+// ONLY on gate-pass. Blocked/duplicate/invalid scans never get a token, so the
+// capture endpoint rejects them — no image is ever written for an invalid scan
+// ("no wasted capture on already-invalid scans"). This replaces the previous
+// notional S3 multipart upload with a local filesystem write + sha256 checksum
+// verification, and binds a transaction-scoped image reference (path + checksum
+// + timestamp) to the transaction state held in Redis.
+const CAPTURE_HMAC_SECRET    = process.env.CAPTURE_HMAC_SECRET || process.env.SESSION_SECRET || 'grahaksathi_secret';
+const CAPTURE_TOKEN_TTL_S    = parseInt(process.env.CAPTURE_TOKEN_TTL) || 120;   // capture window after approval (s)
+const CAPTURE_STATE_TTL_S    = parseInt(process.env.CAPTURE_STATE_TTL) || 600;   // Redis txn-capture state lifetime (s)
+const CHECKOUT_CAPTURES_ROOT = process.env.CHECKOUT_CAPTURES_DIR
+    ? path.resolve(process.env.CHECKOUT_CAPTURES_DIR)
+    : path.join(__dirname, 'store-data', 'checkout-captures');
+if ((process.env.CAPTURE_HMAC_SECRET || '').length === 0 && process.env.NODE_ENV === 'production')
+    console.warn('⚠  CAPTURE_HMAC_SECRET not set — falling back to SESSION_SECRET for capture tokens.');
+
+function captureStateKey(txnRef) { return `txn:capture:${txnRef}`; }
+
+// Sign a compact HMAC token: base64url(payload) + "." + base64url(HMAC-SHA256).
+function signCaptureToken(payload) {
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig  = crypto.createHmac('sha256', CAPTURE_HMAC_SECRET).update(body).digest('base64url');
+    return `${body}.${sig}`;
+}
+// Verify signature (constant-time) + expiry. Returns the payload or null.
+function verifyCaptureToken(token) {
+    if (typeof token !== 'string' || token.indexOf('.') === -1) return null;
+    const [body, sig] = token.split('.');
+    if (!body || !sig) return null;
+    const expected = crypto.createHmac('sha256', CAPTURE_HMAC_SECRET).update(body).digest('base64url');
+    const a = Buffer.from(sig), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    let payload;
+    try { payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch { return null; }
+    if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) return null;
+    return payload;
+}
+
+// Write a captured frame to LOCAL storage and verify the bytes on disk with a
+// sha256 checksum (fail if the write was corrupted). Replaces S3 multipart PUT.
+function writeCaptureLocally(shopId, txnRef, imageB64) {
+    let b64 = String(imageB64 || '');
+    if (b64.startsWith('data:')) { const i = b64.indexOf(','); if (i !== -1) b64 = b64.slice(i + 1); }
+    const buf = Buffer.from(b64, 'base64');
+    if (!buf || buf.length === 0) throw new Error('empty or invalid image data');
+    const expected = crypto.createHash('sha256').update(buf).digest('hex');
+    fs.mkdirSync(path.join(CHECKOUT_CAPTURES_ROOT, String(shopId)), { recursive: true });
+    const abs = path.join(CHECKOUT_CAPTURES_ROOT, String(shopId), `${txnRef}.jpg`);
+    fs.writeFileSync(abs, buf);
+    // Read back and re-hash: proves the persisted file is byte-identical.
+    const actual = crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+    if (actual !== expected) {
+        try { fs.unlinkSync(abs); } catch {}
+        throw new Error('checksum mismatch after write');
+    }
+    return { path: `store-data/checkout-captures/${shopId}/${txnRef}.jpg`, checksum: actual, bytes: buf.length };
+}
+
+// Called on gate-pass: create the transaction-scoped capture state in Redis and
+// return the HMAC token the client needs to upload the frame.
+async function issueCaptureAuthorization(shop, barcode, mkId, verifyResult) {
+    const txnRef = 'CAP-' + generateTransactionId(12);
+    const now = Date.now();
+    const exp = now + CAPTURE_TOKEN_TTL_S * 1000;
+    const state = {
+        txn_ref:      txnRef,
+        shop_id:      shop.id,
+        barcode,
+        mk_id:        mkId || null,
+        gate:         'passed',
+        status:       'awaiting_capture',
+        product_name: verifyResult.product_name || null,
+        verified_at:  new Date(now).toISOString(),
+        image:        null,
+    };
+    try { await redisClient.set(captureStateKey(txnRef), JSON.stringify(state), { EX: CAPTURE_STATE_TTL_S }); }
+    catch (e) { console.warn('capture state store failed (non-fatal):', e.message); }
+    return {
+        txn_ref:            txnRef,
+        capture_token:      signCaptureToken({ txn_ref: txnRef, shop_id: shop.id, barcode, exp }),
+        capture_expires_in: CAPTURE_TOKEN_TTL_S,
+    };
+}
+
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
 
 app.post('/api/checkout/verify', isAuth, async (req, res) => {
@@ -1171,11 +1260,92 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
         }
 
         broadcastToShop(shop.id, { type: 'TXN_RESULT', barcode: barcode.trim(), result: { ...verifyResult, barcode: barcode.trim() } });
+
+        // ── Post-gate capture authorization ──────────────────────────────────
+        // ONLY an approved scan (i.e. one that passed the dedup + Redis lock +
+        // DB/fraud gate) receives an HMAC capture token. Blocked/duplicate/
+        // invalid scans either returned earlier or fall through here without a
+        // token, so the client cannot capture or store an image for them. The
+        // token is attached to the direct HTTP response only — it is deliberately
+        // kept OUT of the WS broadcast above so capture credentials aren't fanned
+        // out to every terminal on the shop channel.
+        if (verifyResult.status === 'approved') {
+            try {
+                const auth = await issueCaptureAuthorization(shop, barcode.trim(), mk_id, verifyResult);
+                verifyResult.capture_token      = auth.capture_token;
+                verifyResult.txn_ref            = auth.txn_ref;
+                verifyResult.capture_expires_in = auth.capture_expires_in;
+            } catch (e) {
+                console.warn('capture authorization issue failed (non-fatal):', e.message);
+            }
+        }
         return res.status(200).json(verifyResult);
 
     } finally {
         await redisClient.del(lockKey).catch(() => {});
     }
+});
+
+// POST /api/checkout/capture — accept the camera frame for an APPROVED scan.
+// This is the enforcement point for "capture only after the gate passes": it
+// requires a valid, unexpired HMAC capture token (issued only on approval),
+// writes the frame to LOCAL storage with sha256 checksum verification, and binds
+// the image reference (path + checksum + timestamp) to the transaction state in
+// Redis. Without a token the request is rejected — an invalid scan can never
+// cause an image to be written.
+app.post('/api/checkout/capture', isAuth, async (req, res) => {
+    const shop = req.session.user;
+    const { capture_token, image_b64 } = req.body || {};
+
+    // 1) HMAC GATE — reject anything not authorised by a gate-pass token.
+    const payload = verifyCaptureToken(capture_token);
+    if (!payload)
+        return res.status(401).json({ ok: false, message: 'Missing, invalid, or expired capture authorization. Capture is only permitted after a scan passes the verification gate.' });
+    if (payload.shop_id !== shop.id)
+        return res.status(403).json({ ok: false, message: 'Capture authorization does not belong to this shop.' });
+    if (!image_b64 || typeof image_b64 !== 'string')
+        return res.status(400).json({ ok: false, message: 'image_b64 is required.' });
+
+    // 2) Transaction state must still exist (not expired) and be awaiting capture.
+    let state = null;
+    try { const raw = await redisClient.get(captureStateKey(payload.txn_ref)); if (raw) state = JSON.parse(raw); }
+    catch (e) { console.warn('capture state read failed:', e.message); }
+    if (!state)
+        return res.status(409).json({ ok: false, message: 'Capture window expired or transaction state not found.' });
+    if (state.status === 'captured')   // idempotent: don't overwrite an existing capture
+        return res.status(200).json({ ok: true, already: true, txn_ref: payload.txn_ref, image_ref: state.image });
+
+    // 3) LOCAL WRITE + CHECKSUM VERIFICATION (replaces the S3 multipart upload).
+    let ref;
+    try { ref = writeCaptureLocally(shop.id, payload.txn_ref, image_b64); }
+    catch (e) { return res.status(422).json({ ok: false, message: 'Capture write/verify failed: ' + e.message }); }
+
+    // 4) Bind the transaction-scoped image reference to the Redis state.
+    state.status = 'captured';
+    state.image  = { path: ref.path, checksum: ref.checksum, algo: 'sha256', bytes: ref.bytes, captured_at: new Date().toISOString() };
+    try {
+        const ttl = await redisClient.ttl(captureStateKey(payload.txn_ref));
+        await redisClient.set(captureStateKey(payload.txn_ref), JSON.stringify(state), { EX: ttl > 0 ? ttl : CAPTURE_STATE_TTL_S });
+    } catch (e) { console.warn('capture state update failed (non-fatal):', e.message); }
+
+    console.log(`📸 Checkout capture stored — shop ${shop.id}, txn ${payload.txn_ref}, ${ref.bytes}B, sha256 ${ref.checksum.slice(0, 12)}…`);
+    return res.json({ ok: true, txn_ref: payload.txn_ref, image_ref: state.image });
+});
+
+// GET /api/checkout/capture/:txnRef — read the transaction-scoped capture state
+// from Redis (same-shop only). Lets a terminal/manager confirm the bound image
+// reference (path + checksum + timestamp) for an approved scan.
+app.get('/api/checkout/capture/:txnRef', isAuth, async (req, res) => {
+    const shop   = req.session.user;
+    const txnRef = String(req.params.txnRef || '').trim();
+    if (!/^CAP-\d{6,18}$/.test(txnRef))
+        return res.status(400).json({ ok: false, message: 'Invalid capture reference.' });
+    let state = null;
+    try { const raw = await redisClient.get(captureStateKey(txnRef)); if (raw) state = JSON.parse(raw); }
+    catch (e) { console.warn('capture state read failed:', e.message); }
+    if (!state) return res.status(404).json({ ok: false, message: 'Capture state not found or expired.' });
+    if (state.shop_id !== shop.id) return res.status(403).json({ ok: false, message: 'Not your transaction.' });
+    return res.json({ ok: true, ...state });
 });
 
 app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
